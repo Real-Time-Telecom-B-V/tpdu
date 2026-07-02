@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tpdu"
+description = "SMS Transfer-layer PDU codec (3GPP TS 23.040 / 23.038 / 24.011) — Rust-backed"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [{ name = "Real Time Telecom B.V." }]
+keywords = ["sms", "tpdu", "gsm", "3gpp", "telecom"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Communications :: Telephony",
+    "Intended Audience :: Telecommunications Industry",
+]
+# Version is taken from Cargo.toml by maturin.
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Real-Time-Telecom-B-V/tpdu"
+Repository = "https://github.com/Real-Time-Telecom-B-V/tpdu"
+
+[tool.maturin]
+# Build the PyO3 extension module. NOT abi3: the module supports free-threaded
+# CPython (PEP 703, `gil_used = false`), which the stable ABI can't express, so
+# CI builds version-specific wheels including the free-threaded (`t`) variants.
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]

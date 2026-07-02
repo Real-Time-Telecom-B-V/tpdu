@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Python / maturin build artifacts
+/dist
+*.so
+*.pyd
+__pycache__/
+.venv*/
+.pytest_cache/

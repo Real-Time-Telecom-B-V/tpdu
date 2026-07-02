@@ -1,0 +1,44 @@
+[package]
+name = "tpdu"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.80"
+description = "SMS Transfer-layer PDU codec (3GPP TS 23.040 / 23.038 / 24.011): SMS-SUBMIT/DELIVER, RP-DATA, GSM 7-bit, UDH — usable from Rust and Python"
+authors = ["Real Time Telecom B.V."]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Real-Time-Telecom-B-V/tpdu"
+homepage = "https://github.com/Real-Time-Telecom-B-V/tpdu"
+keywords = ["sms", "tpdu", "gsm", "3gpp", "telecom"]
+categories = ["encoding", "parsing"]
+exclude = [".github/", "python/", "scripts/"]
+
+[lib]
+name = "tpdu"
+# rlib  → Rust users (`cargo add tpdu`) and the crate's own tests/benches/examples.
+# cdylib → the Python extension module built by maturin (`pip install tpdu`).
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# `python` pulls in the PyO3 bindings + chrono (for SCTS timestamps). It does NOT
+# force `pyo3/extension-module`, so it is safe for a host application that embeds
+# CPython (links libpython itself) and calls `tpdu::register(py, parent)`.
+python = ["dep:pyo3", "dep:chrono"]
+# `extension-module` is what maturin builds the standalone wheel with.
+extension-module = ["python", "pyo3/extension-module"]
+
+[dependencies]
+byteorder = "1.4"
+gsm7 = "=0.3.0"
+tracing = "0.1"
+hex = "0.4"
+pyo3 = { version = "0.29", optional = true }
+chrono = { version = "0.4", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "codec"
+harness = false

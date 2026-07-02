@@ -1,0 +1,7 @@
+# Clippy configuration for tpdu.
+#
+# A few constructors mirror the wide shape of SMS PDUs / the SMPP-style
+# `deliver_sm` field set (originating address, DCS, PID, UDH flags, SCTS, …),
+# so they legitimately take more than the default 7 arguments. Raise the
+# threshold so the lint still catches genuinely unwieldy signatures.
+too-many-arguments-threshold = 12

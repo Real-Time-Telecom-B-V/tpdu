@@ -1,0 +1,74 @@
+# .github/workflows/ci.yml — tpdu CI
+#
+# Two jobs: the Rust crate (format + lint + test + benches-compile + leak check)
+# and the Python bindings (build the extension across a CPython matrix — including
+# free-threaded builds — and run pytest, which also asserts the module doesn't
+# re-enable the GIL).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (python feature)
+        run: cargo clippy --features python --lib -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Benches compile
+        run: cargo bench --no-run
+
+      # Deterministic counting-allocator leak check (tight budget) — gates.
+      - name: Memory-leak check
+        run: cargo run --release --example leak_check
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Includes a free-threaded (PEP 703) build — the "t" suffix — so the
+        # GIL-free assertion in the test-suite actually exercises a no-GIL build.
+        # Free-threaded must be >= 3.14: PyO3 0.29 rejects free-threaded 3.13.
+        python: ["3.11", "3.12", "3.13", "3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install maturin + pytest
+        run: pip install maturin pytest
+
+      - name: Build + install the extension
+        run: |
+          maturin build --release --features extension-module --out dist --interpreter python
+          pip install --no-index --find-links dist tpdu
+
+      - name: Pytest
+        run: pytest python/tests -q
