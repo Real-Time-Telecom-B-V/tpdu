@@ -788,7 +788,11 @@ impl SmsDeliverBuilder {
 }
 
 /// Builder for [`RpDataNetworkToMs`]. See [`RpDataNetworkToMs::builder`].
-#[pyclass(module = "tpdu", name = "RpDataNetworkToMsBuilder", skip_from_py_object)]
+#[pyclass(
+    module = "tpdu",
+    name = "RpDataNetworkToMsBuilder",
+    skip_from_py_object
+)]
 pub struct RpDataNetworkToMsBuilder {
     sms_deliver: crate::SmsDeliver,
     rp_message_type: u8,

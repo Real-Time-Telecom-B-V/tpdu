@@ -699,7 +699,11 @@ mod tests {
 
     #[test]
     fn sms_address_builder_matches_literal() {
-        let built = SMSAddress::builder().ton(1).npi(1).address("15550100").build();
+        let built = SMSAddress::builder()
+            .ton(1)
+            .npi(1)
+            .address("15550100")
+            .build();
         assert_eq!(
             built,
             SMSAddress {
@@ -716,16 +720,26 @@ mod tests {
             .value(vec![0x00, 0x03, 0x42, 0x02, 0x01])
             .build();
         assert_eq!(built.user_data_header_length, 5);
-        assert_eq!(built.user_data_header_value, vec![0x00, 0x03, 0x42, 0x02, 0x01]);
+        assert_eq!(
+            built.user_data_header_value,
+            vec![0x00, 0x03, 0x42, 0x02, 0x01]
+        );
 
         // Explicit override wins over the derived length.
-        let overridden = UserDataHeader::builder().value(vec![0xaa]).length(9).build();
+        let overridden = UserDataHeader::builder()
+            .value(vec![0xaa])
+            .length(9)
+            .build();
         assert_eq!(overridden.user_data_header_length, 9);
     }
 
     #[test]
     fn deliver_builder_gsm7_matches_hand_built_encode() {
-        let oa = SMSAddress::builder().ton(1).npi(1).address("15550199").build();
+        let oa = SMSAddress::builder()
+            .ton(1)
+            .npi(1)
+            .address("15550199")
+            .build();
         let (ud, septets) = pack_gsm7("delivered").unwrap();
 
         let built = SmsDeliver::builder(oa.clone())
@@ -756,7 +770,11 @@ mod tests {
 
     #[test]
     fn deliver_builder_ucs2_sets_byte_length() {
-        let oa = SMSAddress::builder().ton(1).npi(1).address("15550102").build();
+        let oa = SMSAddress::builder()
+            .ton(1)
+            .npi(1)
+            .address("15550102")
+            .build();
         let built = SmsDeliver::builder(oa)
             .dcs(0x08)
             .service_centre_timestamp("25010112000000")
@@ -770,7 +788,11 @@ mod tests {
 
     #[test]
     fn submit_builder_roundtrips_through_parser() {
-        let dest = SMSAddress::builder().ton(1).npi(1).address("15550100").build();
+        let dest = SMSAddress::builder()
+            .ton(1)
+            .npi(1)
+            .address("15550100")
+            .build();
         let submit = SmsSubmit::builder()
             .mr(7)
             .destination_address(dest.clone())
@@ -787,11 +809,14 @@ mod tests {
         // parse it back and confirm the builder produced the right fields.
         let tpdu = {
             let s = &mo.sms_submit;
-            let mut t = vec![
-                (s.tp_udhi as u8) << 6 | s.tp_mti,
-                s.tp_mr,
-            ];
-            t.extend(s.tp_destination_address.as_ref().unwrap().encode(false).unwrap());
+            let mut t = vec![(s.tp_udhi as u8) << 6 | s.tp_mti, s.tp_mr];
+            t.extend(
+                s.tp_destination_address
+                    .as_ref()
+                    .unwrap()
+                    .encode(false)
+                    .unwrap(),
+            );
             t.push(s.tp_pid);
             t.push(s.tp_dcs);
             t.push(s.tp_user_data_length);

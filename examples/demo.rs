@@ -41,7 +41,11 @@ fn main() {
     // 3) Build an outbound MT SMS-DELIVER wrapped in RP-DATA (Network -> MS).
     //    The builders default the flags and TP-MTI and derive TP-User-Data-Length
     //    for you; you stay explicit about the data coding (`.dcs(0)` = GSM 7-bit).
-    let oa = SMSAddress::builder().ton(1).npi(1).address("15550199").build();
+    let oa = SMSAddress::builder()
+        .ton(1)
+        .npi(1)
+        .address("15550199")
+        .build();
     let deliver = SmsDeliver::builder(oa.clone())
         .mms(true)
         .dcs(0)
