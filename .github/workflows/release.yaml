@@ -16,6 +16,13 @@
 #     `publish-new`-scoped token (TP can't bootstrap a non-existent crate).
 #   * PyPI: create the `tpdu` project's pending publisher → this repo, workflow
 #     `release.yaml`, environment `pypi`.
+#
+# The PyPI jobs (sdist, wheels, pypi) are GATED behind the repo variable
+# `PYPI_PUBLISH` (Settings → Variables → Actions) — the same name the other
+# thirteen public crates use. They stay dormant, and crates.io releases keep
+# working, until RTT has its own PyPI organisation, the pending publisher above
+# exists, and `PYPI_PUBLISH` is set to `true`. `github-release` needs only
+# [crates-io, sbom], so a crates.io-only tag still produces a GitHub Release.
 name: Release
 
 on:
@@ -62,10 +69,10 @@ jobs:
 
   sdist:
     needs: verify-version
-    # PyPI side is opt-in: set repo variable PUBLISH_PYPI=true once the PyPI
+    # PyPI side is opt-in: set repo variable PYPI_PUBLISH=true once the PyPI
     # organisation/project is approved. Until then a tag publishes the crate to
     # crates.io only (the Rust side, which unblocks the dependent crate).
-    if: vars.PUBLISH_PYPI == 'true'
+    if: vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -81,7 +88,7 @@ jobs:
 
   wheels:
     needs: verify-version
-    if: vars.PUBLISH_PYPI == 'true'
+    if: vars.PYPI_PUBLISH == 'true'
     name: wheels ${{ matrix.platform.runner }}-${{ matrix.platform.target }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -115,7 +122,7 @@ jobs:
   pypi:
     name: Publish to PyPI
     needs: [verify-version, sdist, wheels]
-    if: vars.PUBLISH_PYPI == 'true'
+    if: vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -155,7 +162,7 @@ jobs:
   github-release:
     # Does not depend on the (optional) PyPI jobs so a crates.io-only release
     # still cuts the GitHub Release. Re-add `pypi` here if you want the release
-    # gated on the wheels once PUBLISH_PYPI is enabled.
+    # gated on the wheels once PYPI_PUBLISH is enabled.
     needs: [crates-io, sbom]
     runs-on: ubuntu-latest
     permissions:
