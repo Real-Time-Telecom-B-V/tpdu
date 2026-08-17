@@ -30,7 +30,7 @@ extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 byteorder = "1.4"
-gsm7 = "=0.3.0"
+gsm7 = "=0.4.1"
 tracing = "0.1"
 hex = "0.4"
 pyo3 = { version = "0.29", optional = true }
