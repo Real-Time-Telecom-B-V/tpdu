@@ -1,6 +1,6 @@
 [package]
 name = "tpdu"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.80"
 description = "SMS Transfer-layer PDU codec (3GPP TS 23.040 / 23.038 / 24.011): SMS-SUBMIT/DELIVER, RP-DATA, GSM 7-bit, UDH — usable from Rust and Python"
