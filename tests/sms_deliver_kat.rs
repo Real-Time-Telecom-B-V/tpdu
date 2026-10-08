@@ -84,6 +84,26 @@ fn every_first_octet_flag_encodes_where_the_specification_puts_it() {
 }
 
 #[test]
+fn every_first_octet_flag_decodes_from_where_the_specification_puts_it() {
+    for (first_octet, name, user_data) in FLAGS {
+        let deliver = SmsDeliver::decode(&wire(*first_octet, user_data)).expect("decode");
+        assert_eq!(deliver.tp_rp, *first_octet == 0x80, "{name}");
+        assert_eq!(deliver.tp_udhi, *first_octet == 0x40, "{name}");
+        assert_eq!(deliver.tp_sri, *first_octet == 0x20, "{name}");
+        assert_eq!(deliver.tp_lp, *first_octet == 0x08, "{name}");
+        assert_eq!(deliver.tp_mms, *first_octet == 0x04, "{name}");
+        assert_eq!(deliver.tp_mti, 0, "{name}");
+        assert_eq!(deliver.tp_originating_address, address("15550101"));
+        assert_eq!(deliver.tp_pid, 0, "{name}");
+        assert_eq!(deliver.tp_dcs, 4, "{name}");
+        assert_eq!(deliver.tp_service_centre_timestamp, SCTS_DIGITS);
+        assert_eq!(deliver.tp_user_data, octets(user_data)[1..], "{name}");
+    }
+    // TP-MTI 10 from the network is an SMS-STATUS-REPORT.
+    assert!(SmsDeliver::decode(&wire(0x02, "02 68 69")).is_err());
+}
+
+#[test]
 fn wireshark_reads_every_first_octet_flag() {
     let deliver = |builder: tpdu::SmsDeliverBuilder| {
         let deliver = builder

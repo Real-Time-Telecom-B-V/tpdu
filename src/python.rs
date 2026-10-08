@@ -1,8 +1,8 @@
 //! PyO3 bindings for the `tpdu` codec — `import tpdu`.
 //!
 //! The Python API mirrors the Rust crate: parse RP-DATA / SMS-SUBMIT, build
-//! SMS-DELIVER / RP-DATA Network→MS / RP-ACK, and pack/unpack GSM 7-bit. Use it
-//! to:
+//! SMS-DELIVER / RP-DATA Network→MS / RP-ACK, and pack/unpack GSM 7-bit with or
+//! without a user-data header. Use it to:
 //!
 //! * parse RP-DATA carrying SMS-SUBMIT (UE-originated MO traffic arriving as the
 //!   body of a SIP MESSAGE on the Gm interface);
@@ -23,6 +23,7 @@ use std::io::Cursor;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
+use pyo3::IntoPyObjectExt;
 
 /// Surface codec errors to Python as `ValueError`.
 impl From<crate::Error> for PyErr {
@@ -75,6 +76,10 @@ fn add_contents(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RpDataNetworkToMsBuilder>()?;
     m.add_class::<SmsSubmitReportBuilder>()?;
     m.add_class::<RpAckNetworkToMsBuilder>()?;
+    m.add_function(wrap_pyfunction!(pack_gsm7_with_header, m)?)?;
+    m.add_function(wrap_pyfunction!(unpack_gsm7_with_header, m)?)?;
+    m.add_function(wrap_pyfunction!(user_data_coding, m)?)?;
+    m.add_function(wrap_pyfunction!(timestamp_digits, m)?)?;
     m.add_function(wrap_pyfunction!(parse_rp_data, m)?)?;
     m.add_function(wrap_pyfunction!(parse_sms_submit, m)?)?;
     m.add_function(wrap_pyfunction!(destination_from_tpdu, m)?)?;
@@ -250,9 +255,21 @@ impl SmsSubmit {
             .map(Address::from_inner)
     }
 
+    /// TP-Validity-Period in the format `tp_vpf` announces: an `int` for the
+    /// relative format (2), the 14-digit `str` of a time stamp for the
+    /// absolute format (3), the seven `bytes` as received for the enhanced
+    /// format (1), `None` when there is none (0).
     #[getter]
-    fn tp_validity_period(&self) -> Option<u8> {
-        self.inner.tp_validity_period
+    fn tp_validity_period<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.inner
+            .tp_validity_period
+            .as_ref()
+            .map(|validity_period| match validity_period {
+                crate::ValidityPeriod::Relative(value) => (*value).into_bound_py_any(py),
+                crate::ValidityPeriod::Absolute(digits) => digits.as_str().into_bound_py_any(py),
+                crate::ValidityPeriod::Enhanced(octets) => Ok(PyBytes::new(py, octets).into_any()),
+            })
+            .transpose()
     }
     #[getter]
     fn tp_user_data_length(&self) -> u8 {
@@ -264,29 +281,42 @@ impl SmsSubmit {
         PyBytes::new(py, &self.inner.tp_user_data_raw)
     }
 
+    /// The readable form of the user data: the header octets when `tp_udhi`
+    /// is set, then the short message, which is UTF-8 text when the data
+    /// coding selects the GSM 7-bit alphabet and the octets as received
+    /// otherwise. `tp_user_data_raw` is the same field as on the wire.
     #[getter]
     fn tp_user_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.inner.tp_user_data)
     }
 
-    /// Decoded user data as a Python str when DCS=0 (GSM 7-bit) or
-    /// DCS=8 (UCS-2). Returns None for binary / unknown encodings.
+    /// The user-data header as on the wire (the length octet, then the
+    /// information elements), or None when `tp_udhi` is not set.
+    #[getter]
+    fn tp_user_data_header<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.inner
+            .tp_user_data_header
+            .as_ref()
+            .map(|header| PyBytes::new(py, &header.encode()))
+    }
+
+    /// The short message as a Python str, without its header, when the data
+    /// coding selects the GSM 7-bit alphabet or UCS-2 (TS 23.038 §4, message
+    /// classes included). Returns None for 8-bit and compressed data.
     fn text(&self) -> Option<String> {
-        match self.inner.tp_dcs {
-            0 => Some(String::from_utf8_lossy(&self.inner.tp_user_data).into_owned()),
-            8 => {
-                let bytes = &self.inner.tp_user_data;
-                if bytes.len() % 2 != 0 {
-                    return None;
-                }
-                let codepoints: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .collect();
-                Some(String::from_utf16_lossy(&codepoints))
-            }
-            _ => None,
-        }
+        let header_octets = self
+            .inner
+            .tp_user_data_header
+            .as_ref()
+            .map_or(0, |header| header.user_data_header_value.len() + 1);
+        let message = self.inner.tp_user_data.get(header_octets..)?;
+        decode_text(self.inner.tp_dcs, message)
+    }
+
+    /// Encode to wire bytes (TS 23.040 §9.2.2.2), from `tp_user_data_raw`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.encode()?;
+        Ok(PyBytes::new(py, &bytes))
     }
 
     fn __repr__(&self) -> String {
@@ -318,9 +348,9 @@ impl SmsDeliver {
     /// values; override via kwargs.
     ///
     /// `user_data_length` (TP-UDL) defaults to `len(user_data)` — correct for
-    /// 8-bit and UCS-2 DCS, where TP-UDL counts octets. For DCS=0 (GSM 7-bit
-    /// packed) TP-UDL must count *septets*, which generally differs from the
-    /// packed byte count: pass it explicitly (use `pack_gsm7` to get both).
+    /// 8-bit and UCS-2 DCS, where TP-UDL counts octets. For a 7-bit DCS
+    /// TP-UDL counts *septets*, which cannot be told from the packed bytes, so
+    /// it must be passed (`pack_gsm7` returns both); leaving it out raises.
     #[new]
     #[pyo3(signature = (
         originating_address,
@@ -349,10 +379,10 @@ impl SmsDeliver {
         tp_dcs: u8,
         scts: Option<String>,
         user_data_length: Option<u8>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let scts = scts.unwrap_or_else(now_scts);
-        let tp_user_data_length = user_data_length.unwrap_or(user_data.len() as u8);
-        Self {
+        let tp_user_data_length = default_user_data_length(tp_dcs, &user_data, user_data_length)?;
+        Ok(Self {
             inner: crate::SmsDeliver {
                 tp_rp,
                 tp_udhi,
@@ -367,7 +397,66 @@ impl SmsDeliver {
                 tp_user_data_length,
                 tp_user_data: user_data,
             },
-        }
+        })
+    }
+
+    #[getter]
+    fn tp_rp(&self) -> bool {
+        self.inner.tp_rp
+    }
+    #[getter]
+    fn tp_udhi(&self) -> bool {
+        self.inner.tp_udhi
+    }
+    #[getter]
+    fn tp_sri(&self) -> bool {
+        self.inner.tp_sri
+    }
+    #[getter]
+    fn tp_lp(&self) -> bool {
+        self.inner.tp_lp
+    }
+    #[getter]
+    fn tp_mms(&self) -> bool {
+        self.inner.tp_mms
+    }
+    #[getter]
+    fn tp_pid(&self) -> u8 {
+        self.inner.tp_pid
+    }
+    #[getter]
+    fn tp_dcs(&self) -> u8 {
+        self.inner.tp_dcs
+    }
+    #[getter]
+    fn tp_originating_address(&self) -> Address {
+        Address::from_inner(self.inner.tp_originating_address.clone())
+    }
+    /// TP-SCTS as its 14 digits.
+    #[getter]
+    fn scts(&self) -> String {
+        self.inner.tp_service_centre_timestamp.clone()
+    }
+    #[getter]
+    fn tp_user_data_length(&self) -> u8 {
+        self.inner.tp_user_data_length
+    }
+    /// TP-User-Data as on the wire (packed septets for a 7-bit DCS, the header
+    /// in front when `tp_udhi` is set).
+    #[getter]
+    fn tp_user_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.tp_user_data)
+    }
+
+    /// The short message as a Python str, without its header, for a 7-bit or
+    /// UCS-2 data coding. Returns None for 8-bit and compressed data.
+    fn text(&self) -> PyResult<Option<String>> {
+        wire_text(
+            self.inner.tp_dcs,
+            self.inner.tp_udhi,
+            self.inner.tp_user_data_length,
+            &self.inner.tp_user_data,
+        )
     }
 
     /// Start a fluent [`SmsDeliverBuilder`] for `originating_address`. Mirrors
@@ -506,6 +595,35 @@ impl RpDataNetworkToMs {
         }
     }
 
+    #[getter]
+    fn rp_message_type(&self) -> u8 {
+        self.inner.rp_message_type
+    }
+    #[getter]
+    fn rp_message_reference(&self) -> u8 {
+        self.inner.rp_message_reference
+    }
+    #[getter]
+    fn rp_originator_address(&self) -> Option<Address> {
+        self.inner
+            .rp_originator_address
+            .clone()
+            .map(Address::from_inner)
+    }
+    #[getter]
+    fn rp_destination_address(&self) -> Option<Address> {
+        self.inner
+            .rp_destination_address
+            .clone()
+            .map(Address::from_inner)
+    }
+    #[getter]
+    fn sms_deliver(&self) -> SmsDeliver {
+        SmsDeliver {
+            inner: self.inner.sms_deliver.clone(),
+        }
+    }
+
     /// Encode to wire bytes — drop into a SIP MESSAGE body with
     /// `Content-Type: application/vnd.3gpp.sms`.
     fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
@@ -514,12 +632,14 @@ impl RpDataNetworkToMs {
     }
 }
 
-// ── SmsSubmitReport (RP-ACK TPDU payload, n→ms) ─────────────────────────
+// ── SmsSubmitReport (RP-ACK / RP-ERROR TPDU payload, n→ms) ──────────────
 
-/// SMS-SUBMIT-REPORT for RP-ACK (TS 23.040 §9.2.2.1a).
+/// SMS-SUBMIT-REPORT (TS 23.040 §9.2.2.2a).
 ///
 /// Carries TP-SCTS back to the UE inside an RP-ACK Network→MS; the SC
-/// timestamp lets the UE confirm when the network accepted the MO.
+/// timestamp lets the UE confirm when the network accepted the MO. Given a
+/// `tp_failure_cause` (§9.2.3.22) it is the layout an RP-ERROR carries
+/// instead.
 #[pyclass(module = "tpdu", name = "SmsSubmitReport", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct SmsSubmitReport {
@@ -531,15 +651,74 @@ impl SmsSubmitReport {
     /// `scts` defaults to UTC-now in TS 23.040 §9.2.3.11 form (14 hex digits,
     /// BCD-pair-swapped at encode time).
     #[new]
-    #[pyo3(signature = (*, tp_udhi = false, tp_parameter_indicator = 0, scts = None))]
-    fn new(tp_udhi: bool, tp_parameter_indicator: u8, scts: Option<String>) -> Self {
+    #[pyo3(signature = (
+        *,
+        tp_udhi = false,
+        tp_parameter_indicator = 0,
+        scts = None,
+        tp_failure_cause = None,
+        tp_pid = None,
+        tp_dcs = None,
+        user_data = None,
+        user_data_length = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        tp_udhi: bool,
+        tp_parameter_indicator: u8,
+        scts: Option<String>,
+        tp_failure_cause: Option<u8>,
+        tp_pid: Option<u8>,
+        tp_dcs: Option<u8>,
+        user_data: Option<Vec<u8>>,
+        user_data_length: Option<u8>,
+    ) -> Self {
         Self {
             inner: crate::SmsSubmitReport {
                 tp_udhi: tp_udhi as u8,
+                tp_failure_cause,
                 tp_parameter_indicator,
                 tp_service_centre_timestamp: scts.unwrap_or_else(now_scts),
+                tp_pid,
+                tp_dcs,
+                tp_user_data_length: user_data_length,
+                tp_user_data: user_data.unwrap_or_default(),
             },
         }
+    }
+
+    #[getter]
+    fn tp_udhi(&self) -> bool {
+        self.inner.tp_udhi != 0
+    }
+    #[getter]
+    fn tp_failure_cause(&self) -> Option<u8> {
+        self.inner.tp_failure_cause
+    }
+    #[getter]
+    fn tp_parameter_indicator(&self) -> u8 {
+        self.inner.tp_parameter_indicator
+    }
+    /// TP-SCTS as its 14 digits.
+    #[getter]
+    fn scts(&self) -> String {
+        self.inner.tp_service_centre_timestamp.clone()
+    }
+    #[getter]
+    fn tp_pid(&self) -> Option<u8> {
+        self.inner.tp_pid
+    }
+    #[getter]
+    fn tp_dcs(&self) -> Option<u8> {
+        self.inner.tp_dcs
+    }
+    #[getter]
+    fn tp_user_data_length(&self) -> Option<u8> {
+        self.inner.tp_user_data_length
+    }
+    #[getter]
+    fn tp_user_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.tp_user_data)
     }
 
     /// Start a fluent [`SmsSubmitReportBuilder`] (SCTS defaults to UTC-now).
@@ -547,6 +726,7 @@ impl SmsSubmitReport {
     fn builder() -> SmsSubmitReportBuilder {
         SmsSubmitReportBuilder {
             tp_udhi: false,
+            tp_failure_cause: None,
             tp_parameter_indicator: 0,
             scts: None,
         }
@@ -560,7 +740,7 @@ impl SmsSubmitReport {
 
 // ── RpAckNetworkToMs (RP-ACK n→ms over a SIP MESSAGE) ───────────────────
 
-/// RP-ACK Network→MS (TS 24.011 §7.3.2.1).
+/// RP-ACK Network→MS (TS 24.011 §7.3.3).
 ///
 /// Built by the IP-SM-GW immediately after accepting an MO RP-DATA from a UE;
 /// `rp_message_reference` must echo the inbound RP-MR so the UE can correlate.
@@ -746,10 +926,34 @@ impl SmsDeliverBuilder {
     /// `.dcs(0)`. A packing failure surfaces at `build()`.
     fn gsm7_text<'py>(mut slf: PyRefMut<'py, Self>, text: &str) -> PyRefMut<'py, Self> {
         match crate::pack_gsm7(text) {
-            Ok((bytes, septets)) => {
-                slf.user_data = bytes;
-                slf.user_data_length = Some(septets as u8);
-            }
+            Ok((bytes, septets)) => match u8::try_from(septets) {
+                Ok(length) => {
+                    slf.user_data = bytes;
+                    slf.user_data_length = Some(length);
+                }
+                Err(_) => slf.err = Some(too_long(septets, "septets")),
+            },
+            Err(e) => slf.err = Some(e),
+        }
+        slf
+    }
+    /// Pack `text` as GSM 7-bit behind `header` (the user-data header as it
+    /// goes on the wire, length octet first) and set the user data + septet
+    /// TP-UDL, which counts the header too (TS 23.040 §9.2.3.24). Pair with
+    /// `.dcs(0).udhi(True)`. A packing failure surfaces at `build()`.
+    fn gsm7_text_with_header<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        header: Vec<u8>,
+        text: &str,
+    ) -> PyRefMut<'py, Self> {
+        match crate::pack_gsm7_with_header(&header, text) {
+            Ok((bytes, septets)) => match u8::try_from(septets) {
+                Ok(length) => {
+                    slf.user_data = bytes;
+                    slf.user_data_length = Some(length);
+                }
+                Err(_) => slf.err = Some(too_long(septets, "septets")),
+            },
             Err(e) => slf.err = Some(e),
         }
         slf
@@ -758,8 +962,13 @@ impl SmsDeliverBuilder {
     /// with `.dcs(0x08)`.
     fn ucs2_text<'py>(mut slf: PyRefMut<'py, Self>, text: &str) -> PyRefMut<'py, Self> {
         let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
-        slf.user_data_length = Some(bytes.len() as u8);
-        slf.user_data = bytes;
+        match u8::try_from(bytes.len()) {
+            Ok(length) => {
+                slf.user_data_length = Some(length);
+                slf.user_data = bytes;
+            }
+            Err(_) => slf.err = Some(too_long(bytes.len(), "octets")),
+        }
         slf
     }
     fn build(&self) -> PyResult<SmsDeliver> {
@@ -767,7 +976,8 @@ impl SmsDeliverBuilder {
             return Err(e.clone().into());
         }
         let scts = self.scts.clone().unwrap_or_else(now_scts);
-        let tp_user_data_length = self.user_data_length.unwrap_or(self.user_data.len() as u8);
+        let tp_user_data_length =
+            default_user_data_length(self.tp_dcs, &self.user_data, self.user_data_length)?;
         Ok(SmsDeliver {
             inner: crate::SmsDeliver {
                 tp_rp: self.tp_rp,
@@ -840,6 +1050,7 @@ impl RpDataNetworkToMsBuilder {
 #[pyclass(module = "tpdu", name = "SmsSubmitReportBuilder", skip_from_py_object)]
 pub struct SmsSubmitReportBuilder {
     tp_udhi: bool,
+    tp_failure_cause: Option<u8>,
     tp_parameter_indicator: u8,
     scts: Option<String>,
 }
@@ -848,6 +1059,11 @@ pub struct SmsSubmitReportBuilder {
 impl SmsSubmitReportBuilder {
     fn udhi(mut slf: PyRefMut<'_, Self>, v: bool) -> PyRefMut<'_, Self> {
         slf.tp_udhi = v;
+        slf
+    }
+    /// TP-Failure-Cause: makes this the report an RP-ERROR carries.
+    fn failure_cause(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.tp_failure_cause = Some(v);
         slf
     }
     fn parameter_indicator(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
@@ -862,8 +1078,13 @@ impl SmsSubmitReportBuilder {
         SmsSubmitReport {
             inner: crate::SmsSubmitReport {
                 tp_udhi: self.tp_udhi as u8,
+                tp_failure_cause: self.tp_failure_cause,
                 tp_parameter_indicator: self.tp_parameter_indicator,
                 tp_service_centre_timestamp: self.scts.clone().unwrap_or_else(now_scts),
+                tp_pid: None,
+                tp_dcs: None,
+                tp_user_data_length: None,
+                tp_user_data: Vec::new(),
             },
         }
     }
@@ -940,14 +1161,16 @@ fn destination_from_tpdu(tpdu: &[u8]) -> PyResult<String> {
     parsed
         .tp_destination_address
         .map(|a| a.address)
+        .filter(|digits| !digits.is_empty())
         .ok_or_else(|| PyValueError::new_err("SMS-SUBMIT has no TP-DA"))
 }
 
 /// Build an SMS-DELIVER TPDU from SMPP `deliver_sm`-shaped fields — used by a
 /// routing layer to wrap an inbound `deliver_sm` for MT-Forward-SM via MAP / SGd.
 ///
-/// Defaults to UTC-now SCTS unless overridden. Pass `user_data_length` (TP-UDL)
-/// explicitly when `data_coding=0` so it counts septets, not packed bytes.
+/// Defaults to UTC-now SCTS unless overridden. `user_data_length` (TP-UDL) is
+/// required when `data_coding` selects the 7-bit alphabet, where it counts
+/// septets and cannot be told from the packed bytes.
 #[pyfunction]
 #[pyo3(signature = (
     source_addr, source_addr_ton = 1, source_addr_npi = 1,
@@ -971,7 +1194,8 @@ fn build_sms_deliver_tpdu(
     scts: Option<String>,
     user_data_length: Option<u8>,
 ) -> PyResult<Vec<u8>> {
-    let tp_user_data_length = user_data_length.unwrap_or(short_message.len() as u8);
+    let tp_user_data_length =
+        default_user_data_length(data_coding, &short_message, user_data_length)?;
     let deliver = crate::SmsDeliver {
         tp_rp: false,
         tp_udhi: udhi,
@@ -993,7 +1217,7 @@ fn build_sms_deliver_tpdu(
     Ok(deliver.encode()?)
 }
 
-/// Pack a Unicode string into GSM 7-bit septets per TS 23.038 §6.2.1.
+/// Pack a Unicode string into GSM 7-bit septets per TS 23.038 §6.1.2.1.1.
 ///
 /// Returns `(packed_bytes, septet_count)` where `septet_count` is the value to
 /// use for TP-UDL on a DCS=0 SMS-DELIVER (extension chars `^{}\[~]|€` and
@@ -1004,16 +1228,154 @@ fn pack_gsm7<'py>(py: Python<'py>, text: &str) -> PyResult<(Bound<'py, PyBytes>,
     Ok((PyBytes::new(py, &bytes), septets))
 }
 
-/// Unpack `septets` septets from a packed GSM 7-bit buffer.
-///
-/// Drops the trailing `@` produced by carrier padding when the decoded char
-/// count exceeds `septets` (TS 23.038 §6.2.1 disambiguates with TP-UDL).
+/// Unpack exactly `septets` septets (the TP-UDL of the message) from a packed
+/// GSM 7-bit buffer. Whatever follows them is padding and is ignored.
 #[pyfunction]
 fn unpack_gsm7(data: &[u8], septets: usize) -> PyResult<String> {
     Ok(crate::unpack_gsm7(data, septets)?)
 }
 
+/// Build the complete TP-User-Data of a GSM 7-bit message that carries a
+/// user-data header (TS 23.040 §9.2.3.24): the header octets, fill bits to the
+/// next septet boundary, then the packed text.
+///
+/// `header` is the header as it goes on the wire, length octet first. Returns
+/// `(tp_user_data, tp_user_data_length)`; the length counts septets, those of
+/// the header and its fill bits included. Set TP-UDHI on the TPDU.
+#[pyfunction]
+fn pack_gsm7_with_header<'py>(
+    py: Python<'py>,
+    header: &[u8],
+    text: &str,
+) -> PyResult<(Bound<'py, PyBytes>, usize)> {
+    let (bytes, septets) = crate::pack_gsm7_with_header(header, text)?;
+    Ok((PyBytes::new(py, &bytes), septets))
+}
+
+/// Split the TP-User-Data of a GSM 7-bit message with TP-UDHI set into
+/// `(header, text)`. `septets` is the TP-UDL of the message.
+#[pyfunction]
+fn unpack_gsm7_with_header<'py>(
+    py: Python<'py>,
+    data: &[u8],
+    septets: usize,
+) -> PyResult<(Bound<'py, PyBytes>, String)> {
+    let (header, text) = crate::unpack_gsm7_with_header(data, septets)?;
+    Ok((PyBytes::new(py, &header), text))
+}
+
+/// How a TP-DCS octet codes the user data (TS 23.038 §4): `"gsm7"`, `"8bit"`,
+/// `"ucs2"` or `"compressed"`. TP-UDL counts septets for `"gsm7"` and octets
+/// for the rest.
+#[pyfunction]
+fn user_data_coding(dcs: u8) -> &'static str {
+    match crate::user_data_coding(dcs) {
+        crate::UserDataCoding::Gsm7Bit => "gsm7",
+        crate::UserDataCoding::EightBit => "8bit",
+        crate::UserDataCoding::Ucs2 => "ucs2",
+        crate::UserDataCoding::Compressed => "compressed",
+    }
+}
+
+/// Build the 14-digit string the time fields take (TP-SCTS, TP-Discharge-Time,
+/// absolute TP-VP) from local time and its offset from GMT in quarter hours,
+/// negative west of Greenwich (TS 23.040 §9.2.3.11).
+#[pyfunction]
+#[pyo3(signature = (year, month, day, hour, minute, second, time_zone_quarter_hours = 0))]
+fn timestamp_digits(
+    year: u8,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    time_zone_quarter_hours: i8,
+) -> PyResult<String> {
+    Ok(crate::timestamp_digits(
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        time_zone_quarter_hours,
+    )?)
+}
+
 // ── Internals ───────────────────────────────────────────────────────────
+
+/// The error a text helper keeps for `build()` when the text is too long.
+fn too_long(count: usize, unit: &str) -> crate::Error {
+    format!("user data of {count} {unit} does not fit TP-User-Data-Length").into()
+}
+
+/// TP-UDL for user data given without one: the octet count, which is right
+/// for every coding but the 7-bit alphabet. There TP-UDL counts septets, and
+/// nine packed octets may hold nine or ten of them, so the caller has to say.
+fn default_user_data_length(dcs: u8, user_data: &[u8], given: Option<u8>) -> PyResult<u8> {
+    if let Some(length) = given {
+        return Ok(length);
+    }
+    if !user_data.is_empty() && crate::user_data_coding(dcs) == crate::UserDataCoding::Gsm7Bit {
+        return Err(PyValueError::new_err(format!(
+            "user_data_length is required for the 7-bit data coding 0x{dcs:02x}: TP-UDL counts \
+             septets, which the packed bytes alone do not determine (pack_gsm7 returns it)"
+        )));
+    }
+    u8::try_from(user_data.len())
+        .map_err(|_| PyValueError::new_err("user data does not fit TP-User-Data-Length"))
+}
+
+/// A short message (no header) in the readable form as a str: UTF-8 for the
+/// 7-bit alphabet, UTF-16BE for UCS-2, None for anything else.
+fn decode_text(dcs: u8, message: &[u8]) -> Option<String> {
+    match crate::user_data_coding(dcs) {
+        crate::UserDataCoding::Gsm7Bit => Some(String::from_utf8_lossy(message).into_owned()),
+        crate::UserDataCoding::Ucs2 => decode_ucs2(message),
+        _ => None,
+    }
+}
+
+fn decode_ucs2(message: &[u8]) -> Option<String> {
+    if message.len() % 2 != 0 {
+        return None;
+    }
+    let code_units: Vec<u16> = message
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    Some(String::from_utf16_lossy(&code_units))
+}
+
+/// The short message of a TP-User-Data as on the wire, as a str.
+fn wire_text(
+    dcs: u8,
+    header_indicator: bool,
+    length: u8,
+    user_data: &[u8],
+) -> PyResult<Option<String>> {
+    match crate::user_data_coding(dcs) {
+        crate::UserDataCoding::Gsm7Bit => {
+            let text = if header_indicator {
+                crate::unpack_gsm7_with_header(user_data, usize::from(length))?.1
+            } else {
+                crate::unpack_gsm7(user_data, usize::from(length))?
+            };
+            Ok(Some(text))
+        }
+        crate::UserDataCoding::Ucs2 => {
+            let header_octets = if header_indicator {
+                user_data
+                    .first()
+                    .map_or(0, |length| usize::from(*length) + 1)
+            } else {
+                0
+            };
+            Ok(user_data.get(header_octets..).and_then(decode_ucs2))
+        }
+        _ => Ok(None),
+    }
+}
 
 /// 14-digit BCD-pair-swapped UTC timestamp (yymmddHHMMSS + tz placeholder).
 /// `SmsDeliver::encode` reads the trailing pair as the timezone byte to match

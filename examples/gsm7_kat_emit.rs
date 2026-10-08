@@ -23,7 +23,7 @@
 use tpdu::{pack_gsm7, RpDataNetworkToMs, SMSAddress, SmsDeliver};
 
 /// The same texts as `tests/gsm7_kat.rs`: base alphabet, the national block, the
-/// Greek block, the full escape table, and the 7-septet CR-pad boundary.
+/// Greek block, the full escape table, and the 7-septet boundary.
 const TEXTS: &[&str] = &[
     "hellohello",
     "hello",
