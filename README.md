@@ -19,11 +19,14 @@ MO/MT-Forward-SM paths — no async, no I/O, no shared state.
 `tpdu` encodes and decodes the protocol data units that carry SMS between
 handsets, IMS, and signalling cores:
 
-- **RP-DATA** (MS→Network and Network→MS) — the relay-layer wrapper used on the
-  Gm interface (SIP MESSAGE body) and inside MAP / Diameter MO/MT-Forward-SM.
-- **SMS-SUBMIT**, **SMS-DELIVER** and **SMS-SUBMIT-REPORT** TPDUs.
-- **GSM 7-bit** default-alphabet septet packing (TS 23.038 §6.2.1) and **UCS-2**
-  user data; the **User-Data-Header** (concatenation and other IEs).
+- **RP-DATA** (MS→Network and Network→MS), **RP-ACK**, **RP-ERROR** and
+  **RP-SMMA** — the relay layer used on the Gm interface (SIP MESSAGE body) and
+  inside MAP / Diameter MO/MT-Forward-SM.
+- **SMS-SUBMIT**, **SMS-DELIVER** and **SMS-STATUS-REPORT** TPDUs, and the
+  **SMS-SUBMIT-REPORT** / **SMS-DELIVER-REPORT** that acknowledge them.
+- **GSM 7-bit** default-alphabet septet packing (TS 23.038 §6.1.2.1.1) and
+  **UCS-2** user data; the **User-Data-Header** (concatenation and other IEs),
+  including the fill bits a header needs in front of 7-bit text.
 - **BCD** and **GSM-7 alphanumeric** SMS addresses with TON/NPI.
 
 Pure Rust, no async, no I/O — just bytes in, bytes out. The same codec is
@@ -102,6 +105,58 @@ let wire: Vec<u8> = mt.encode()?;
 The public-field structs are still there when you want full control — the
 builder is an additive convenience, not a replacement.
 
+A part of a concatenated message in the 7-bit alphabet needs its header kept in
+octets and the text packed behind fill bits (TS 23.040 §9.2.3.24).
+`gsm7_text_with_header` does that and counts the header in TP-UDL:
+
+```rust
+use tpdu::{SMSAddress, SmsDeliver, UserDataHeader};
+
+let oa = SMSAddress::builder().ton(1).npi(1).address("15550199").build();
+// Concatenation: reference 0x2A, 2 parts, this is part 1.
+let header = UserDataHeader::builder().value([0x00, 0x03, 0x2a, 0x02, 0x01]).build();
+let part = SmsDeliver::builder(oa)
+    .udhi(true)
+    .dcs(0)
+    .service_centre_timestamp("25010112000000")
+    .gsm7_text_with_header(&header, "hello")
+    .build()?;
+assert_eq!(part.tp_user_data_length, 12);             // 7 header septets + 5
+# Ok::<(), tpdu::Error>(())
+```
+
+Turning a mobile-originated message down, and telling the sender later what
+became of one that was accepted:
+
+```rust
+use tpdu::{RpDataNetworkToMsStatusReport, RpErrorNetworkToMs, SMSAddress,
+           SmsStatusReport, SmsSubmitReport};
+
+// RP-ERROR, cause 21 (short message transfer rejected), with the
+// SMS-SUBMIT-REPORT that says why: TP-FCS 0xC3, invalid SME address.
+let report = SmsSubmitReport::builder()
+    .failure_cause(0xc3)
+    .service_centre_timestamp("25010112000000")
+    .build();
+let error = RpErrorNetworkToMs::builder(21)
+    .message_reference(7)                            // RP-MR of the RP-DATA
+    .sms_submit_report(report)
+    .build()
+    .encode()?;
+
+// SMS-STATUS-REPORT for the SMS-SUBMIT that had TP-MR 42.
+let recipient = SMSAddress::builder().ton(1).npi(1).address("15550100").build();
+let status = SmsStatusReport::builder(recipient)
+    .mr(42)
+    .mms(true)
+    .service_centre_timestamp("25010112000000")
+    .discharge_time("25010112000500")
+    .status(0x00)                                    // received by the SME
+    .build();
+let wire = RpDataNetworkToMsStatusReport::builder(status).build().encode()?;
+# Ok::<(), tpdu::Error>(())
+```
+
 ## Quick start — Python
 
 The Python API is ergonomic and slightly higher-level than the Rust one
@@ -145,9 +200,31 @@ deliver_tpdu = tpdu.build_sms_deliver_tpdu(
 )
 ```
 
-> **Note on TP-UDL:** for GSM 7-bit (DCS=0) the User-Data-Length counts
-> *septets*, not packed bytes — pass the `septets` returned by `pack_gsm7`. For
-> 8-bit and UCS-2 it counts octets and defaults to `len(user_data)`.
+> **Note on TP-UDL:** for a 7-bit data coding (DCS 0, and the codings that add
+> a message class such as 0x10 or 0xF1) the User-Data-Length counts *septets*,
+> not packed bytes — pass the `septets` returned by `pack_gsm7`. It cannot be
+> worked out from the packed bytes, so the Python constructors raise when it is
+> missing. For 8-bit and UCS-2 it counts octets and defaults to
+> `len(user_data)`. `encode()` refuses a length that contradicts the user data.
+
+The rest of the relay layer follows the same pattern:
+
+```python
+# RP-ERROR back to the UE, with the SMS-SUBMIT-REPORT that carries TP-FCS.
+report = tpdu.SmsSubmitReport(tp_failure_cause=0xC3)
+body = tpdu.RpErrorNetworkToMs(21, rp_message_reference=7, sms_submit_report=report).encode()
+
+# What the UE answers to an MT message: RpErrorMsToNetwork or RpErrorNetworkToMs.
+error = tpdu.parse_rp_error(rp_error_bytes)
+print(error.rp_cause, error.rp_diagnostic)
+
+# A status report for the SMS-SUBMIT that had TP-MR 42.
+status = tpdu.SmsStatusReport(tpdu.Address("15550100"), tp_mr=42, tp_status=0x00)
+body = tpdu.RpDataNetworkToMsStatusReport(status).encode()
+
+# A part of a concatenated message in the 7-bit alphabet: header, fill bits, text.
+user_data, septets = tpdu.pack_gsm7_with_header(bytes([5, 0, 3, 0x2A, 2, 1]), "hello")
+```
 
 ## Standards coverage
 
@@ -155,16 +232,27 @@ Derived from the implementation — not aspirational.
 
 | PDU / element | Direction | Codec | Notes |
 |---|---|---|---|
-| **SMS-SUBMIT** (TS 23.040 §9.2.2.2) | MO | decode | TP-MTI/RP/UDHI/SRR/RD/VPF flags, TP-MR, TP-DA, TP-PID, TP-DCS, optional TP-VP, TP-UD |
-| **SMS-DELIVER** (TS 23.040 §9.2.2.1) | MT | encode | TP flags, TP-OA, TP-PID, TP-DCS, TP-SCTS, TP-UD |
-| **SMS-SUBMIT-REPORT** (TS 23.040 §9.2.2.1a) | MT | encode | RP-ACK payload carrying TP-SCTS back to the UE |
-| **RP-DATA** MS→Network (TS 24.011 §7.3.1.1) | MO | decode | RP-MR, optional RP-OA/RP-DA, wrapped SMS-SUBMIT |
-| **RP-DATA** Network→MS (TS 24.011 §7.3.1.1) | MT | encode | RP-MR, optional RP-OA/RP-DA, wrapped SMS-DELIVER |
-| **RP-ACK** Network→MS (TS 24.011 §7.3.2.1) | MT | encode | echoes inbound RP-MR; RP-User-Data IE carries SMS-SUBMIT-REPORT |
-| **GSM 7-bit** (TS 23.038 §6.2.1) | — | pack / unpack | default alphabet, septet packing; extension chars (`^{}\[~]|€`, FF) count as 2 septets |
-| **UCS-2** | — | pass-through | DCS=8 user data carried verbatim; Python `.text()` decodes UTF-16BE |
-| **User-Data-Header** | — | encode / decode | UDHL + IE bytes (concatenation, etc.); surfaced when TP-UDHI is set |
-| **SMS addresses** | — | encode / decode | BCD digits and GSM-7 alphanumeric (TON=5); TON/NPI preserved |
+| **SMS-SUBMIT** (TS 23.040 §9.2.2.2) | MO | encode / decode | TP-MTI/RP/UDHI/SRR/RD flags, TP-VPF with all four TP-VP formats (none, relative, absolute, enhanced), TP-MR, TP-DA, TP-PID, TP-DCS, TP-UD |
+| **SMS-DELIVER** (TS 23.040 §9.2.2.1) | MT | encode / decode | TP-RP/UDHI/SRI/LP/MMS flags, TP-OA, TP-PID, TP-DCS, TP-SCTS, TP-UD |
+| **SMS-STATUS-REPORT** (TS 23.040 §9.2.2.3) | MT | encode / decode | TP-UDHI/SRQ/LP/MMS flags, TP-MR, TP-RA, TP-SCTS, TP-DT, TP-ST, optional TP-PI and what it announces |
+| **SMS-SUBMIT-REPORT** (TS 23.040 §9.2.2.2a) | MT | encode / decode | both layouts: for RP-ACK, and for RP-ERROR with TP-FCS; TP-PI, TP-SCTS, optional TP-PID / TP-DCS / TP-UD |
+| **SMS-DELIVER-REPORT** (TS 23.040 §9.2.2.1a) | MO | encode / decode | both layouts: for RP-ACK, and for RP-ERROR with TP-FCS; TP-PI, optional TP-PID / TP-DCS / TP-UD |
+| **RP-DATA** MS→Network (TS 24.011 §7.3.1.2) | MO | encode / decode | RP-MR, RP-OA / RP-DA, wrapped SMS-SUBMIT |
+| **RP-DATA** Network→MS (TS 24.011 §7.3.1.1) | MT | encode / decode | RP-MR, RP-OA / RP-DA, wrapped SMS-DELIVER or SMS-STATUS-REPORT |
+| **RP-ACK** Network→MS (TS 24.011 §7.3.3) | MT | encode | echoes inbound RP-MR; RP-User-Data IE carries SMS-SUBMIT-REPORT |
+| **RP-ERROR** (TS 24.011 §7.3.4) | both | encode / decode | RP-Cause with optional diagnostic; RP-User-Data IE carries SMS-SUBMIT-REPORT (Network→MS) or SMS-DELIVER-REPORT (MS→Network) |
+| **RP-SMMA** (TS 24.011 §7.3.2) | MO | encode / decode | RP-MR |
+| **GSM 7-bit** (TS 23.038 §6.1.2.1.1, §6.2.1) | — | pack / unpack | default alphabet and its extension table (`^{}\[~]|€`, FF: 2 septets each); zero fill; with or without a user-data header |
+| **TP-DCS** (TS 23.038 §4) | — | classify | every coding group: 7-bit, 8-bit, UCS-2 and compressed, message classes and message-waiting groups included |
+| **UCS-2** | — | pass-through | user data carried verbatim; Python `.text()` decodes UTF-16BE |
+| **User-Data-Header** (TS 23.040 §9.2.3.24) | — | encode / decode | UDHL + IE bytes (concatenation, etc.); fill bits to the septet boundary for 7-bit text |
+| **SMS addresses** (TS 23.040 §9.1.2.5) | — | encode / decode | BCD digits incl. `*`, `#`, `a`, `b`, `c`, and GSM-7 alphanumeric (TON=5); TON/NPI preserved |
+| **Time stamps** (TS 23.040 §9.2.3.11) | — | encode / decode | TP-SCTS, TP-DT and absolute TP-VP as 14 semi-octet digits; `timestamp_digits` builds them, negative time zones included |
+
+Not covered: SMS-COMMAND, decoding an RP-ACK (either direction), the national
+language shift tables of TS 23.038 §6.2.1.2 (the header elements pass through
+as octets, the text is read with the default alphabet), and compressed user
+data (TS 23.042), which is carried as octets and not unpacked.
 
 Scope is deliberately the transfer and relay layers (TP / RP): there is no CP
 layer, no network transport, and no async — those belong to the higher layers
@@ -172,19 +260,29 @@ that carry these PDUs.
 
 ## Public API at a glance
 
-**Rust** — types `SMSAddress`, `UserDataHeader`, `SmsSubmit`, `SmsDeliver`,
-`SmsSubmitReport`, `RpDataMsToNetwork`, `RpDataNetworkToMs`, `RpAck`, `Error`;
-functions `parse_rp_data`, `decode_sms_submit_tpdu`, `pack_gsm7`,
-`unpack_gsm7`. Each encodable type exposes `.encode()`, and every constructable
-type a fluent `::builder(..)`.
+**Rust** — types `SMSAddress`, `UserDataHeader`, `ValidityPeriod`,
+`UserDataCoding`, `SmsSubmit`, `SmsDeliver`, `SmsStatusReport`,
+`SmsSubmitReport`, `SmsDeliverReport`, `RpDataMsToNetwork`,
+`RpDataNetworkToMs`, `RpDataNetworkToMsStatusReport`,
+`RpDataNetworkToMsMessage`, `RpAck`, `RpErrorNetworkToMs`,
+`RpErrorMsToNetwork`, `RpSmma`, `Error`; functions `parse_rp_data`,
+`parse_rp_data_network_to_ms`, `decode_sms_submit_tpdu`, `pack_gsm7`,
+`unpack_gsm7`, `pack_gsm7_with_header`, `unpack_gsm7_with_header`,
+`user_data_coding`, `timestamp_digits`. Each type exposes `.encode()`, the ones
+that arrive from a peer a `decode(..)` (or one of the `parse_*` functions), and
+every constructable type a fluent `::builder(..)`.
 
 **Python** — classes `Address`, `UserDataHeader`, `SmsSubmit`, `SmsDeliver`,
-`RpData`, `RpDataNetworkToMs`, `SmsSubmitReport`, `RpAckNetworkToMs`; functions
-`parse_rp_data`, `parse_sms_submit`, `destination_from_tpdu`,
-`build_sms_deliver_tpdu`, `pack_gsm7`, `unpack_gsm7`. Constructable classes also
-expose a fluent `.builder(..)`. The two surfaces are kept in lockstep but are
-not byte-identical APIs — the Python side adds kwargs, defaults and `.text()`
-decoding.
+`SmsStatusReport`, `SmsSubmitReport`, `SmsDeliverReport`, `RpData`,
+`RpDataNetworkToMs`, `RpDataNetworkToMsStatusReport`, `RpAckNetworkToMs`,
+`RpErrorNetworkToMs`, `RpErrorMsToNetwork`, `RpSmma`; functions
+`parse_rp_data`, `parse_rp_data_network_to_ms`, `parse_sms_submit`,
+`parse_sms_status_report`, `parse_rp_error`, `parse_rp_smma`,
+`destination_from_tpdu`, `build_sms_deliver_tpdu`, `pack_gsm7`, `unpack_gsm7`,
+`pack_gsm7_with_header`, `unpack_gsm7_with_header`, `user_data_coding`,
+`timestamp_digits`. Constructable classes also expose a fluent `.builder(..)`.
+The two surfaces are kept in lockstep but are not byte-identical APIs — the
+Python side adds kwargs, defaults and `.text()` decoding.
 
 ## Cargo feature flags
 
