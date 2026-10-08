@@ -1,7 +1,8 @@
 //! PyO3 bindings for the `tpdu` codec — `import tpdu`.
 //!
-//! The Python API mirrors the Rust crate: parse RP-DATA / SMS-SUBMIT, build
-//! SMS-DELIVER / RP-DATA Network→MS / RP-ACK, and pack/unpack GSM 7-bit with or
+//! The Python API mirrors the Rust crate: parse and build RP-DATA in both
+//! directions, RP-ACK, RP-ERROR and RP-SMMA, the SMS-SUBMIT / SMS-DELIVER /
+//! SMS-STATUS-REPORT TPDUs and their reports, and pack/unpack GSM 7-bit with or
 //! without a user-data header. Use it to:
 //!
 //! * parse RP-DATA carrying SMS-SUBMIT (UE-originated MO traffic arriving as the
@@ -76,6 +77,22 @@ fn add_contents(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RpDataNetworkToMsBuilder>()?;
     m.add_class::<SmsSubmitReportBuilder>()?;
     m.add_class::<RpAckNetworkToMsBuilder>()?;
+    m.add_class::<SmsDeliverReport>()?;
+    m.add_class::<SmsStatusReport>()?;
+    m.add_class::<RpDataNetworkToMsStatusReport>()?;
+    m.add_class::<RpErrorNetworkToMs>()?;
+    m.add_class::<RpErrorMsToNetwork>()?;
+    m.add_class::<RpSmma>()?;
+    m.add_class::<SmsDeliverReportBuilder>()?;
+    m.add_class::<SmsStatusReportBuilder>()?;
+    m.add_class::<RpDataNetworkToMsStatusReportBuilder>()?;
+    m.add_class::<RpErrorNetworkToMsBuilder>()?;
+    m.add_class::<RpErrorMsToNetworkBuilder>()?;
+    m.add_class::<RpSmmaBuilder>()?;
+    m.add_function(wrap_pyfunction!(parse_rp_data_network_to_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_sms_status_report, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_rp_error, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_rp_smma, m)?)?;
     m.add_function(wrap_pyfunction!(pack_gsm7_with_header, m)?)?;
     m.add_function(wrap_pyfunction!(unpack_gsm7_with_header, m)?)?;
     m.add_function(wrap_pyfunction!(user_data_coding, m)?)?;
@@ -639,7 +656,7 @@ impl RpDataNetworkToMs {
 /// Carries TP-SCTS back to the UE inside an RP-ACK Network→MS; the SC
 /// timestamp lets the UE confirm when the network accepted the MO. Given a
 /// `tp_failure_cause` (§9.2.3.22) it is the layout an RP-ERROR carries
-/// instead.
+/// instead, see `RpErrorNetworkToMs`.
 #[pyclass(module = "tpdu", name = "SmsSubmitReport", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct SmsSubmitReport {
@@ -784,6 +801,567 @@ impl RpAckNetworkToMs {
     fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = self.inner.encode()?;
         Ok(PyBytes::new(py, &bytes))
+    }
+}
+
+// ── SmsDeliverReport (RP-ACK / RP-ERROR TPDU payload, ms→n) ─────────────
+
+/// SMS-DELIVER-REPORT (TS 23.040 §9.2.2.1a), the acknowledgement of an
+/// SMS-DELIVER or SMS-STATUS-REPORT.
+///
+/// Without `tp_failure_cause` it is the layout an RP-ACK carries; with it,
+/// the one an RP-ERROR carries.
+#[pyclass(module = "tpdu", name = "SmsDeliverReport", from_py_object)]
+#[derive(Debug, Clone)]
+pub struct SmsDeliverReport {
+    inner: crate::SmsDeliverReport,
+}
+
+#[pymethods]
+impl SmsDeliverReport {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        tp_failure_cause = None,
+        tp_udhi = false,
+        tp_parameter_indicator = 0,
+        tp_pid = None,
+        tp_dcs = None,
+        user_data = None,
+        user_data_length = None,
+    ))]
+    fn new(
+        tp_failure_cause: Option<u8>,
+        tp_udhi: bool,
+        tp_parameter_indicator: u8,
+        tp_pid: Option<u8>,
+        tp_dcs: Option<u8>,
+        user_data: Option<Vec<u8>>,
+        user_data_length: Option<u8>,
+    ) -> Self {
+        Self {
+            inner: crate::SmsDeliverReport {
+                tp_udhi,
+                tp_failure_cause,
+                tp_parameter_indicator,
+                tp_pid,
+                tp_dcs,
+                tp_user_data_length: user_data_length,
+                tp_user_data: user_data.unwrap_or_default(),
+            },
+        }
+    }
+
+    /// Start a fluent [`SmsDeliverReportBuilder`].
+    #[staticmethod]
+    fn builder() -> SmsDeliverReportBuilder {
+        SmsDeliverReportBuilder {
+            inner: crate::SmsDeliverReport::builder().build(),
+        }
+    }
+
+    #[getter]
+    fn tp_udhi(&self) -> bool {
+        self.inner.tp_udhi
+    }
+    #[getter]
+    fn tp_failure_cause(&self) -> Option<u8> {
+        self.inner.tp_failure_cause
+    }
+    #[getter]
+    fn tp_parameter_indicator(&self) -> u8 {
+        self.inner.tp_parameter_indicator
+    }
+    #[getter]
+    fn tp_pid(&self) -> Option<u8> {
+        self.inner.tp_pid
+    }
+    #[getter]
+    fn tp_dcs(&self) -> Option<u8> {
+        self.inner.tp_dcs
+    }
+    #[getter]
+    fn tp_user_data_length(&self) -> Option<u8> {
+        self.inner.tp_user_data_length
+    }
+    #[getter]
+    fn tp_user_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.tp_user_data)
+    }
+
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.encode()?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SmsDeliverReport(tp_failure_cause={:?}, tp_parameter_indicator=0x{:02x})",
+            self.inner.tp_failure_cause, self.inner.tp_parameter_indicator,
+        )
+    }
+}
+
+// ── SmsStatusReport ─────────────────────────────────────────────────────
+
+/// SMS-STATUS-REPORT (TS 23.040 §9.2.2.3): what became of an earlier
+/// SMS-SUBMIT. Wrap it in `RpDataNetworkToMsStatusReport` to send it.
+#[pyclass(module = "tpdu", name = "SmsStatusReport", from_py_object)]
+#[derive(Debug, Clone)]
+pub struct SmsStatusReport {
+    inner: crate::SmsStatusReport,
+}
+
+#[pymethods]
+impl SmsStatusReport {
+    /// `tp_mr` is the TP-Message-Reference of the SMS-SUBMIT the report is
+    /// about and `recipient_address` where that was headed. `scts` (when the
+    /// service centre took it) and `discharge_time` (when `tp_status` was
+    /// reached) default to UTC-now. `tp_mms=True` sets the bit, which says no
+    /// more messages are waiting.
+    #[new]
+    #[pyo3(signature = (
+        recipient_address,
+        *,
+        tp_mr,
+        tp_status = 0,
+        scts = None,
+        discharge_time = None,
+        tp_mms = true,
+        tp_lp = false,
+        tp_srq = false,
+        tp_udhi = false,
+        tp_parameter_indicator = None,
+        tp_pid = None,
+        tp_dcs = None,
+        user_data = None,
+        user_data_length = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        recipient_address: Address,
+        tp_mr: u8,
+        tp_status: u8,
+        scts: Option<String>,
+        discharge_time: Option<String>,
+        tp_mms: bool,
+        tp_lp: bool,
+        tp_srq: bool,
+        tp_udhi: bool,
+        tp_parameter_indicator: Option<u8>,
+        tp_pid: Option<u8>,
+        tp_dcs: Option<u8>,
+        user_data: Option<Vec<u8>>,
+        user_data_length: Option<u8>,
+    ) -> Self {
+        Self {
+            inner: crate::SmsStatusReport {
+                tp_udhi,
+                tp_srq,
+                tp_lp,
+                tp_mms,
+                tp_mr,
+                tp_recipient_address: recipient_address.inner,
+                tp_service_centre_timestamp: scts.unwrap_or_else(now_scts),
+                tp_discharge_time: discharge_time.unwrap_or_else(now_scts),
+                tp_status,
+                tp_parameter_indicator,
+                tp_pid,
+                tp_dcs,
+                tp_user_data_length: user_data_length,
+                tp_user_data: user_data.unwrap_or_default(),
+            },
+        }
+    }
+
+    /// Start a fluent [`SmsStatusReportBuilder`] for `recipient_address`.
+    /// Mirrors the kwargs constructor's defaults (`tp_mms=True`, times =
+    /// UTC-now).
+    #[staticmethod]
+    fn builder(recipient_address: Address) -> SmsStatusReportBuilder {
+        SmsStatusReportBuilder {
+            inner: crate::SmsStatusReport::builder(recipient_address.inner)
+                .mms(true)
+                .build(),
+            scts: None,
+            discharge_time: None,
+        }
+    }
+
+    #[getter]
+    fn tp_udhi(&self) -> bool {
+        self.inner.tp_udhi
+    }
+    #[getter]
+    fn tp_srq(&self) -> bool {
+        self.inner.tp_srq
+    }
+    #[getter]
+    fn tp_lp(&self) -> bool {
+        self.inner.tp_lp
+    }
+    #[getter]
+    fn tp_mms(&self) -> bool {
+        self.inner.tp_mms
+    }
+    #[getter]
+    fn tp_mr(&self) -> u8 {
+        self.inner.tp_mr
+    }
+    #[getter]
+    fn tp_recipient_address(&self) -> Address {
+        Address::from_inner(self.inner.tp_recipient_address.clone())
+    }
+    /// TP-SCTS as its 14 digits.
+    #[getter]
+    fn scts(&self) -> String {
+        self.inner.tp_service_centre_timestamp.clone()
+    }
+    /// TP-Discharge-Time as its 14 digits.
+    #[getter]
+    fn discharge_time(&self) -> String {
+        self.inner.tp_discharge_time.clone()
+    }
+    #[getter]
+    fn tp_status(&self) -> u8 {
+        self.inner.tp_status
+    }
+    #[getter]
+    fn tp_parameter_indicator(&self) -> Option<u8> {
+        self.inner.tp_parameter_indicator
+    }
+    #[getter]
+    fn tp_pid(&self) -> Option<u8> {
+        self.inner.tp_pid
+    }
+    #[getter]
+    fn tp_dcs(&self) -> Option<u8> {
+        self.inner.tp_dcs
+    }
+    #[getter]
+    fn tp_user_data_length(&self) -> Option<u8> {
+        self.inner.tp_user_data_length
+    }
+    #[getter]
+    fn tp_user_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.tp_user_data)
+    }
+
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.encode()?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SmsStatusReport(tp_mr={}, ra={:?}, tp_status=0x{:02x})",
+            self.inner.tp_mr, self.inner.tp_recipient_address.address, self.inner.tp_status,
+        )
+    }
+}
+
+// ── RpDataNetworkToMsStatusReport ───────────────────────────────────────
+
+/// RP-DATA Network→MS (TS 24.011 §7.3.1.1) carrying an SMS-STATUS-REPORT.
+#[pyclass(
+    module = "tpdu",
+    name = "RpDataNetworkToMsStatusReport",
+    skip_from_py_object
+)]
+#[derive(Debug, Clone)]
+pub struct RpDataNetworkToMsStatusReport {
+    inner: crate::RpDataNetworkToMsStatusReport,
+}
+
+#[pymethods]
+impl RpDataNetworkToMsStatusReport {
+    #[new]
+    #[pyo3(signature = (
+        sms_status_report,
+        *,
+        rp_message_reference = 0,
+        rp_originator_address = None,
+        rp_destination_address = None,
+    ))]
+    fn new(
+        sms_status_report: SmsStatusReport,
+        rp_message_reference: u8,
+        rp_originator_address: Option<Address>,
+        rp_destination_address: Option<Address>,
+    ) -> Self {
+        Self {
+            inner: crate::RpDataNetworkToMsStatusReport {
+                rp_message_type: crate::RP_DATA_NETWORK_TO_MS,
+                rp_message_reference,
+                rp_originator_address: rp_originator_address.map(|a| a.inner),
+                rp_destination_address: rp_destination_address.map(|a| a.inner),
+                sms_status_report: sms_status_report.inner,
+            },
+        }
+    }
+
+    /// Start a fluent [`RpDataNetworkToMsStatusReportBuilder`] around
+    /// `sms_status_report`.
+    #[staticmethod]
+    fn builder(sms_status_report: SmsStatusReport) -> RpDataNetworkToMsStatusReportBuilder {
+        RpDataNetworkToMsStatusReportBuilder {
+            inner: crate::RpDataNetworkToMsStatusReport::builder(sms_status_report.inner).build(),
+        }
+    }
+
+    #[getter]
+    fn rp_message_type(&self) -> u8 {
+        self.inner.rp_message_type
+    }
+    #[getter]
+    fn rp_message_reference(&self) -> u8 {
+        self.inner.rp_message_reference
+    }
+    #[getter]
+    fn rp_originator_address(&self) -> Option<Address> {
+        self.inner
+            .rp_originator_address
+            .clone()
+            .map(Address::from_inner)
+    }
+    #[getter]
+    fn rp_destination_address(&self) -> Option<Address> {
+        self.inner
+            .rp_destination_address
+            .clone()
+            .map(Address::from_inner)
+    }
+    #[getter]
+    fn sms_status_report(&self) -> SmsStatusReport {
+        SmsStatusReport {
+            inner: self.inner.sms_status_report.clone(),
+        }
+    }
+
+    /// Encode to wire bytes — drop into a SIP MESSAGE body with
+    /// `Content-Type: application/vnd.3gpp.sms`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.encode()?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+}
+
+// ── RpErrorNetworkToMs / RpErrorMsToNetwork ─────────────────────────────
+
+/// RP-ERROR Network→MS (TS 24.011 §7.3.4): the network turning down an
+/// RP-DATA or RP-SMMA from the UE.
+///
+/// `rp_cause` is the cause value of table 8.4 (e.g. 21, short message
+/// transfer rejected). The optional `sms_submit_report` must have a
+/// `tp_failure_cause`.
+#[pyclass(module = "tpdu", name = "RpErrorNetworkToMs", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct RpErrorNetworkToMs {
+    inner: crate::RpErrorNetworkToMs,
+}
+
+#[pymethods]
+impl RpErrorNetworkToMs {
+    #[new]
+    #[pyo3(signature = (
+        rp_cause,
+        *,
+        rp_message_reference,
+        rp_diagnostic = None,
+        sms_submit_report = None,
+    ))]
+    fn new(
+        rp_cause: u8,
+        rp_message_reference: u8,
+        rp_diagnostic: Option<u8>,
+        sms_submit_report: Option<SmsSubmitReport>,
+    ) -> Self {
+        Self {
+            inner: crate::RpErrorNetworkToMs {
+                rp_message_type: crate::RP_ERROR_NETWORK_TO_MS,
+                rp_message_reference,
+                rp_cause,
+                rp_diagnostic,
+                sms_submit_report: sms_submit_report.map(|report| report.inner),
+            },
+        }
+    }
+
+    /// Start a fluent [`RpErrorNetworkToMsBuilder`] with `rp_cause`.
+    #[staticmethod]
+    fn builder(rp_cause: u8) -> RpErrorNetworkToMsBuilder {
+        RpErrorNetworkToMsBuilder {
+            inner: crate::RpErrorNetworkToMs::builder(rp_cause).build(),
+        }
+    }
+
+    #[getter]
+    fn rp_message_type(&self) -> u8 {
+        self.inner.rp_message_type
+    }
+    #[getter]
+    fn rp_message_reference(&self) -> u8 {
+        self.inner.rp_message_reference
+    }
+    #[getter]
+    fn rp_cause(&self) -> u8 {
+        self.inner.rp_cause
+    }
+    #[getter]
+    fn rp_diagnostic(&self) -> Option<u8> {
+        self.inner.rp_diagnostic
+    }
+    #[getter]
+    fn sms_submit_report(&self) -> Option<SmsSubmitReport> {
+        self.inner
+            .sms_submit_report
+            .clone()
+            .map(|inner| SmsSubmitReport { inner })
+    }
+
+    /// Encode to wire bytes — drop into a SIP MESSAGE body with
+    /// `Content-Type: application/vnd.3gpp.sms`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.encode()?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RpErrorNetworkToMs(mr={}, rp_cause={}, rp_diagnostic={:?})",
+            self.inner.rp_message_reference, self.inner.rp_cause, self.inner.rp_diagnostic,
+        )
+    }
+}
+
+/// RP-ERROR MS→Network (TS 24.011 §7.3.4): the UE turning down an RP-DATA
+/// from the network. The optional `sms_deliver_report` must have a
+/// `tp_failure_cause`.
+#[pyclass(module = "tpdu", name = "RpErrorMsToNetwork", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct RpErrorMsToNetwork {
+    inner: crate::RpErrorMsToNetwork,
+}
+
+#[pymethods]
+impl RpErrorMsToNetwork {
+    #[new]
+    #[pyo3(signature = (
+        rp_cause,
+        *,
+        rp_message_reference,
+        rp_diagnostic = None,
+        sms_deliver_report = None,
+    ))]
+    fn new(
+        rp_cause: u8,
+        rp_message_reference: u8,
+        rp_diagnostic: Option<u8>,
+        sms_deliver_report: Option<SmsDeliverReport>,
+    ) -> Self {
+        Self {
+            inner: crate::RpErrorMsToNetwork {
+                rp_message_type: crate::RP_ERROR_MS_TO_NETWORK,
+                rp_message_reference,
+                rp_cause,
+                rp_diagnostic,
+                sms_deliver_report: sms_deliver_report.map(|report| report.inner),
+            },
+        }
+    }
+
+    /// Start a fluent [`RpErrorMsToNetworkBuilder`] with `rp_cause`.
+    #[staticmethod]
+    fn builder(rp_cause: u8) -> RpErrorMsToNetworkBuilder {
+        RpErrorMsToNetworkBuilder {
+            inner: crate::RpErrorMsToNetwork::builder(rp_cause).build(),
+        }
+    }
+
+    #[getter]
+    fn rp_message_type(&self) -> u8 {
+        self.inner.rp_message_type
+    }
+    #[getter]
+    fn rp_message_reference(&self) -> u8 {
+        self.inner.rp_message_reference
+    }
+    #[getter]
+    fn rp_cause(&self) -> u8 {
+        self.inner.rp_cause
+    }
+    #[getter]
+    fn rp_diagnostic(&self) -> Option<u8> {
+        self.inner.rp_diagnostic
+    }
+    #[getter]
+    fn sms_deliver_report(&self) -> Option<SmsDeliverReport> {
+        self.inner
+            .sms_deliver_report
+            .clone()
+            .map(|inner| SmsDeliverReport { inner })
+    }
+
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.encode()?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RpErrorMsToNetwork(mr={}, rp_cause={}, rp_diagnostic={:?})",
+            self.inner.rp_message_reference, self.inner.rp_cause, self.inner.rp_diagnostic,
+        )
+    }
+}
+
+// ── RpSmma ──────────────────────────────────────────────────────────────
+
+/// RP-SMMA (TS 24.011 §7.3.2): the UE telling the network it has memory
+/// available again.
+#[pyclass(module = "tpdu", name = "RpSmma", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct RpSmma {
+    inner: crate::RpSmma,
+}
+
+#[pymethods]
+impl RpSmma {
+    #[new]
+    #[pyo3(signature = (*, rp_message_reference))]
+    fn new(rp_message_reference: u8) -> Self {
+        Self {
+            inner: crate::RpSmma {
+                rp_message_type: crate::RP_SMMA_MS_TO_NETWORK,
+                rp_message_reference,
+            },
+        }
+    }
+
+    /// Start a fluent [`RpSmmaBuilder`] (RP-Message-Reference defaults to `0`).
+    #[staticmethod]
+    fn builder() -> RpSmmaBuilder {
+        RpSmmaBuilder {
+            rp_message_reference: 0,
+        }
+    }
+
+    #[getter]
+    fn rp_message_type(&self) -> u8 {
+        self.inner.rp_message_type
+    }
+    #[getter]
+    fn rp_message_reference(&self) -> u8 {
+        self.inner.rp_message_reference
+    }
+
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.encode()?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("RpSmma(mr={})", self.inner.rp_message_reference)
     }
 }
 
@@ -1123,6 +1701,256 @@ impl RpAckNetworkToMsBuilder {
     }
 }
 
+/// Builder for [`SmsDeliverReport`]. See [`SmsDeliverReport::builder`].
+#[pyclass(module = "tpdu", name = "SmsDeliverReportBuilder", skip_from_py_object)]
+pub struct SmsDeliverReportBuilder {
+    inner: crate::SmsDeliverReport,
+}
+
+#[pymethods]
+impl SmsDeliverReportBuilder {
+    fn udhi(mut slf: PyRefMut<'_, Self>, v: bool) -> PyRefMut<'_, Self> {
+        slf.inner.tp_udhi = v;
+        slf
+    }
+    /// TP-Failure-Cause: makes this the report an RP-ERROR carries.
+    fn failure_cause(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_failure_cause = Some(v);
+        slf
+    }
+    fn parameter_indicator(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_parameter_indicator = v;
+        slf
+    }
+    fn pid(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_pid = Some(v);
+        slf
+    }
+    fn dcs(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_dcs = Some(v);
+        slf
+    }
+    fn user_data(mut slf: PyRefMut<'_, Self>, v: Vec<u8>) -> PyRefMut<'_, Self> {
+        slf.inner.tp_user_data = v;
+        slf
+    }
+    fn user_data_length(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_user_data_length = Some(v);
+        slf
+    }
+    fn build(&self) -> SmsDeliverReport {
+        SmsDeliverReport {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// Builder for [`SmsStatusReport`]. See [`SmsStatusReport::builder`].
+#[pyclass(module = "tpdu", name = "SmsStatusReportBuilder", skip_from_py_object)]
+pub struct SmsStatusReportBuilder {
+    inner: crate::SmsStatusReport,
+    scts: Option<String>,
+    discharge_time: Option<String>,
+}
+
+#[pymethods]
+impl SmsStatusReportBuilder {
+    fn udhi(mut slf: PyRefMut<'_, Self>, v: bool) -> PyRefMut<'_, Self> {
+        slf.inner.tp_udhi = v;
+        slf
+    }
+    fn srq(mut slf: PyRefMut<'_, Self>, v: bool) -> PyRefMut<'_, Self> {
+        slf.inner.tp_srq = v;
+        slf
+    }
+    fn lp(mut slf: PyRefMut<'_, Self>, v: bool) -> PyRefMut<'_, Self> {
+        slf.inner.tp_lp = v;
+        slf
+    }
+    fn mms(mut slf: PyRefMut<'_, Self>, v: bool) -> PyRefMut<'_, Self> {
+        slf.inner.tp_mms = v;
+        slf
+    }
+    fn mr(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_mr = v;
+        slf
+    }
+    fn recipient_address(mut slf: PyRefMut<'_, Self>, v: Address) -> PyRefMut<'_, Self> {
+        slf.inner.tp_recipient_address = v.inner;
+        slf
+    }
+    fn scts(mut slf: PyRefMut<'_, Self>, v: String) -> PyRefMut<'_, Self> {
+        slf.scts = Some(v);
+        slf
+    }
+    fn discharge_time(mut slf: PyRefMut<'_, Self>, v: String) -> PyRefMut<'_, Self> {
+        slf.discharge_time = Some(v);
+        slf
+    }
+    fn status(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_status = v;
+        slf
+    }
+    fn parameter_indicator(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_parameter_indicator = Some(v);
+        slf
+    }
+    fn pid(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_pid = Some(v);
+        slf
+    }
+    fn dcs(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_dcs = Some(v);
+        slf
+    }
+    fn user_data(mut slf: PyRefMut<'_, Self>, v: Vec<u8>) -> PyRefMut<'_, Self> {
+        slf.inner.tp_user_data = v;
+        slf
+    }
+    fn user_data_length(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.tp_user_data_length = Some(v);
+        slf
+    }
+    fn build(&self) -> SmsStatusReport {
+        let mut inner = self.inner.clone();
+        inner.tp_service_centre_timestamp = self.scts.clone().unwrap_or_else(now_scts);
+        inner.tp_discharge_time = self.discharge_time.clone().unwrap_or_else(now_scts);
+        SmsStatusReport { inner }
+    }
+}
+
+/// Builder for [`RpDataNetworkToMsStatusReport`]. See
+/// [`RpDataNetworkToMsStatusReport::builder`].
+#[pyclass(
+    module = "tpdu",
+    name = "RpDataNetworkToMsStatusReportBuilder",
+    skip_from_py_object
+)]
+pub struct RpDataNetworkToMsStatusReportBuilder {
+    inner: crate::RpDataNetworkToMsStatusReport,
+}
+
+#[pymethods]
+impl RpDataNetworkToMsStatusReportBuilder {
+    fn message_type(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_message_type = v;
+        slf
+    }
+    fn message_reference(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_message_reference = v;
+        slf
+    }
+    fn originator_address(mut slf: PyRefMut<'_, Self>, v: Address) -> PyRefMut<'_, Self> {
+        slf.inner.rp_originator_address = Some(v.inner);
+        slf
+    }
+    fn destination_address(mut slf: PyRefMut<'_, Self>, v: Address) -> PyRefMut<'_, Self> {
+        slf.inner.rp_destination_address = Some(v.inner);
+        slf
+    }
+    fn sms_status_report(mut slf: PyRefMut<'_, Self>, v: SmsStatusReport) -> PyRefMut<'_, Self> {
+        slf.inner.sms_status_report = v.inner;
+        slf
+    }
+    fn build(&self) -> RpDataNetworkToMsStatusReport {
+        RpDataNetworkToMsStatusReport {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// Builder for [`RpErrorNetworkToMs`]. See [`RpErrorNetworkToMs::builder`].
+#[pyclass(
+    module = "tpdu",
+    name = "RpErrorNetworkToMsBuilder",
+    skip_from_py_object
+)]
+pub struct RpErrorNetworkToMsBuilder {
+    inner: crate::RpErrorNetworkToMs,
+}
+
+#[pymethods]
+impl RpErrorNetworkToMsBuilder {
+    fn message_reference(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_message_reference = v;
+        slf
+    }
+    fn cause(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_cause = v;
+        slf
+    }
+    fn diagnostic(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_diagnostic = Some(v);
+        slf
+    }
+    fn sms_submit_report(mut slf: PyRefMut<'_, Self>, v: SmsSubmitReport) -> PyRefMut<'_, Self> {
+        slf.inner.sms_submit_report = Some(v.inner);
+        slf
+    }
+    fn build(&self) -> RpErrorNetworkToMs {
+        RpErrorNetworkToMs {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// Builder for [`RpErrorMsToNetwork`]. See [`RpErrorMsToNetwork::builder`].
+#[pyclass(
+    module = "tpdu",
+    name = "RpErrorMsToNetworkBuilder",
+    skip_from_py_object
+)]
+pub struct RpErrorMsToNetworkBuilder {
+    inner: crate::RpErrorMsToNetwork,
+}
+
+#[pymethods]
+impl RpErrorMsToNetworkBuilder {
+    fn message_reference(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_message_reference = v;
+        slf
+    }
+    fn cause(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_cause = v;
+        slf
+    }
+    fn diagnostic(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_diagnostic = Some(v);
+        slf
+    }
+    fn sms_deliver_report(mut slf: PyRefMut<'_, Self>, v: SmsDeliverReport) -> PyRefMut<'_, Self> {
+        slf.inner.sms_deliver_report = Some(v.inner);
+        slf
+    }
+    fn build(&self) -> RpErrorMsToNetwork {
+        RpErrorMsToNetwork {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// Builder for [`RpSmma`]. See [`RpSmma::builder`].
+#[pyclass(module = "tpdu", name = "RpSmmaBuilder", skip_from_py_object)]
+pub struct RpSmmaBuilder {
+    rp_message_reference: u8,
+}
+
+#[pymethods]
+impl RpSmmaBuilder {
+    fn message_reference(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.rp_message_reference = v;
+        slf
+    }
+    fn build(&self) -> RpSmma {
+        RpSmma {
+            inner: crate::RpSmma {
+                rp_message_type: crate::RP_SMMA_MS_TO_NETWORK,
+                rp_message_reference: self.rp_message_reference,
+            },
+        }
+    }
+}
+
 // ── Module-level helpers ────────────────────────────────────────────────
 
 /// Parse an MS→Network RP-DATA body — the body of a UE-originated SIP MESSAGE
@@ -1138,6 +1966,60 @@ fn parse_rp_data(data: &[u8]) -> PyResult<RpData> {
         sms_submit: SmsSubmit {
             inner: parsed.sms_submit,
         },
+    })
+}
+
+/// Parse a Network→MS RP-DATA body (TS 24.011 §7.3.1.1). Returns an
+/// `RpDataNetworkToMs` when it carries an SMS-DELIVER and an
+/// `RpDataNetworkToMsStatusReport` when it carries an SMS-STATUS-REPORT; the
+/// two are told apart by the TP-MTI of the TPDU.
+#[pyfunction]
+fn parse_rp_data_network_to_ms<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    match crate::parse_rp_data_network_to_ms(data)? {
+        crate::RpDataNetworkToMsMessage::Deliver(inner) => {
+            RpDataNetworkToMs { inner }.into_bound_py_any(py)
+        }
+        crate::RpDataNetworkToMsMessage::StatusReport(inner) => {
+            RpDataNetworkToMsStatusReport { inner }.into_bound_py_any(py)
+        }
+    }
+}
+
+/// Parse a bare SMS-STATUS-REPORT TPDU (TS 23.040 §9.2.2.3).
+#[pyfunction]
+fn parse_sms_status_report(data: &[u8]) -> PyResult<SmsStatusReport> {
+    Ok(SmsStatusReport {
+        inner: crate::SmsStatusReport::decode(data)?,
+    })
+}
+
+/// Parse an RP-ERROR (TS 24.011 §7.3.4) in either direction. Returns an
+/// `RpErrorMsToNetwork` for RP-Message-Type 4 (from the UE, may carry an
+/// SMS-DELIVER-REPORT) and an `RpErrorNetworkToMs` for type 5 (from the
+/// network, may carry an SMS-SUBMIT-REPORT).
+#[pyfunction]
+fn parse_rp_error<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    match data.first().map(|octet| octet & 0x07) {
+        Some(crate::RP_ERROR_MS_TO_NETWORK) => RpErrorMsToNetwork {
+            inner: crate::RpErrorMsToNetwork::decode(data)?,
+        }
+        .into_bound_py_any(py),
+        Some(crate::RP_ERROR_NETWORK_TO_MS) => RpErrorNetworkToMs {
+            inner: crate::RpErrorNetworkToMs::decode(data)?,
+        }
+        .into_bound_py_any(py),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "RP-Message-Type {other} is not RP-ERROR (4 or 5)"
+        ))),
+        None => Err(PyValueError::new_err("empty RP message")),
+    }
+}
+
+/// Parse an RP-SMMA (TS 24.011 §7.3.2).
+#[pyfunction]
+fn parse_rp_smma(data: &[u8]) -> PyResult<RpSmma> {
+    Ok(RpSmma {
+        inner: crate::RpSmma::decode(data)?,
     })
 }
 

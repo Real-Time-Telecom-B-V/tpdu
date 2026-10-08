@@ -3,10 +3,11 @@
 //! Encodes and decodes the protocol data units that carry SMS between handsets,
 //! IMS, and signalling cores:
 //!
-//! - **RP-DATA** (MS→Network and Network→MS) and **RP-ACK** — the relay-layer
-//!   wrapper used on the Gm interface (SIP MESSAGE body) and in MAP/Diameter
-//!   MO/MT-Forward-SM.
-//! - **SMS-SUBMIT** / **SMS-DELIVER** / **SMS-SUBMIT-REPORT** TPDUs.
+//! - **RP-DATA** (MS→Network and Network→MS), **RP-ACK**, **RP-ERROR** and
+//!   **RP-SMMA** — the relay layer used on the Gm interface (SIP MESSAGE body)
+//!   and in MAP/Diameter MO/MT-Forward-SM.
+//! - **SMS-SUBMIT** / **SMS-DELIVER** / **SMS-STATUS-REPORT** TPDUs and the
+//!   **SMS-SUBMIT-REPORT** / **SMS-DELIVER-REPORT** that acknowledge them.
 //! - **GSM 7-bit** (default alphabet, septet packing per TS 23.038
 //!   §6.1.2.1.1) and UCS-2 user data; **User-Data-Header** (concatenation,
 //!   etc.), including the fill bits a header needs in front of 7-bit text.
@@ -24,8 +25,10 @@ use tracing::debug;
 
 mod builder;
 pub use builder::{
-    RpAckBuilder, RpDataMsToNetworkBuilder, RpDataNetworkToMsBuilder, SMSAddressBuilder,
-    SmsDeliverBuilder, SmsSubmitBuilder, SmsSubmitReportBuilder, UserDataHeaderBuilder,
+    RpAckBuilder, RpDataMsToNetworkBuilder, RpDataNetworkToMsBuilder,
+    RpDataNetworkToMsStatusReportBuilder, RpErrorMsToNetworkBuilder, RpErrorNetworkToMsBuilder,
+    RpSmmaBuilder, SMSAddressBuilder, SmsDeliverBuilder, SmsDeliverReportBuilder,
+    SmsStatusReportBuilder, SmsSubmitBuilder, SmsSubmitReportBuilder, UserDataHeaderBuilder,
 };
 
 #[cfg(feature = "python")]
@@ -83,6 +86,11 @@ fn read_octets(cursor: &mut Cursor<&[u8]>, length: usize, what: &str) -> Result<
         .read_exact(&mut buffer)
         .map_err(|e| format!("Unable to read {what} ({length} octets): {e}"))?;
     Ok(buffer)
+}
+
+fn remaining(cursor: &Cursor<&[u8]>) -> usize {
+    let position = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
+    cursor.get_ref().len().saturating_sub(position)
 }
 
 // ── TP-Data-Coding-Scheme (TS 23.038 §4) ─────────────────────────────────────
@@ -778,6 +786,7 @@ impl ValidityPeriod {
 
 const MTI_DELIVER: u8 = 0b00;
 const MTI_SUBMIT: u8 = 0b01;
+const MTI_STATUS_REPORT: u8 = 0b10;
 
 fn bit(octet: u8, number: u8) -> bool {
     (octet >> number) & 0x01 == 1
@@ -1198,6 +1207,229 @@ impl SmsSubmitReport {
     }
 }
 
+/// SMS-DELIVER-REPORT (TS 23.040 §9.2.2.1a), the acknowledgement of an
+/// SMS-DELIVER or SMS-STATUS-REPORT.
+///
+/// Like [`SmsSubmitReport`] it has two layouts: without a failure cause inside
+/// an RP-ACK, with TP-Failure-Cause inside an RP-ERROR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmsDeliverReport {
+    pub tp_udhi: bool,
+    pub tp_failure_cause: Option<u8>,
+    pub tp_parameter_indicator: u8,
+    pub tp_pid: Option<u8>,
+    pub tp_dcs: Option<u8>,
+    pub tp_user_data_length: Option<u8>,
+    pub tp_user_data: Vec<u8>,
+}
+
+impl SmsDeliverReport {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut data = vec![((self.tp_udhi as u8) << 6) | MTI_DELIVER];
+        data.extend(self.tp_failure_cause);
+        check_parameter_indicator(
+            "SMS-DELIVER-REPORT",
+            self.tp_parameter_indicator,
+            self.tp_pid,
+            self.tp_dcs,
+            self.tp_user_data_length,
+        )?;
+        data.push(self.tp_parameter_indicator);
+        encode_parameters(
+            "SMS-DELIVER-REPORT",
+            self.tp_pid,
+            self.tp_dcs,
+            self.tp_user_data_length,
+            &self.tp_user_data,
+            &mut data,
+        )?;
+        Ok(data)
+    }
+
+    /// Decode the layout carried in an RP-ACK (no TP-Failure-Cause).
+    pub fn decode_for_rp_ack(data: &[u8]) -> Result<Self, Error> {
+        Self::decode(data, false)
+    }
+
+    /// Decode the layout carried in an RP-ERROR (TP-Failure-Cause present).
+    ///
+    /// When any unused bit of the first octet is set the rest is not examined
+    /// and the cause reads as "Unspecified error cause", as TS 23.040
+    /// §9.2.2.1a requires of a receiver.
+    pub fn decode_for_rp_error(data: &[u8]) -> Result<Self, Error> {
+        Self::decode(data, true)
+    }
+
+    fn decode(data: &[u8], failure: bool) -> Result<Self, Error> {
+        let mut cursor = Cursor::new(data);
+        let first_byte = read_octet(&mut cursor, "first octet")?;
+        if first_byte & 0x03 != MTI_DELIVER {
+            return Err(
+                format!("TP-MTI {} is not SMS-DELIVER-REPORT (0)", first_byte & 0x03).into(),
+            );
+        }
+        if failure && first_byte & REPORT_UNUSED_BITS != 0 {
+            return Ok(SmsDeliverReport {
+                tp_udhi: false,
+                tp_failure_cause: Some(FAILURE_CAUSE_UNSPECIFIED),
+                tp_parameter_indicator: 0,
+                tp_pid: None,
+                tp_dcs: None,
+                tp_user_data_length: None,
+                tp_user_data: Vec::new(),
+            });
+        }
+        let tp_failure_cause = if failure {
+            Some(read_octet(&mut cursor, "TP-Failure-Cause")?)
+        } else {
+            None
+        };
+        let tp_parameter_indicator = decode_parameter_indicator(&mut cursor)?;
+        let parameters = decode_parameters(&mut cursor, tp_parameter_indicator)?;
+
+        Ok(SmsDeliverReport {
+            tp_udhi: bit(first_byte, 6),
+            tp_failure_cause,
+            tp_parameter_indicator,
+            tp_pid: parameters.tp_pid,
+            tp_dcs: parameters.tp_dcs,
+            tp_user_data_length: parameters.tp_user_data_length,
+            tp_user_data: parameters.tp_user_data,
+        })
+    }
+}
+
+/// SMS-STATUS-REPORT (TS 23.040 §9.2.2.3), the service centre telling the
+/// sender what became of an earlier SMS-SUBMIT or SMS-COMMAND.
+///
+/// `tp_mr` is the TP-Message-Reference of that earlier TPDU,
+/// `tp_recipient_address` where it was headed, `tp_service_centre_timestamp`
+/// when the service centre took it and `tp_discharge_time` when the outcome in
+/// `tp_status` (§9.2.3.15) was reached. Both times are the 14 digits of
+/// §9.2.3.11, see [`timestamp_digits`].
+///
+/// TP-Parameter-Indicator and what it announces are optional as a whole:
+/// leave `tp_parameter_indicator` `None` and the report ends at TP-Status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmsStatusReport {
+    pub tp_udhi: bool,
+    pub tp_srq: bool,
+    pub tp_lp: bool,
+    pub tp_mms: bool,
+    pub tp_mr: u8,
+    pub tp_recipient_address: SMSAddress,
+    pub tp_service_centre_timestamp: String,
+    pub tp_discharge_time: String,
+    pub tp_status: u8,
+    pub tp_parameter_indicator: Option<u8>,
+    pub tp_pid: Option<u8>,
+    pub tp_dcs: Option<u8>,
+    pub tp_user_data_length: Option<u8>,
+    pub tp_user_data: Vec<u8>,
+}
+
+impl SmsStatusReport {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut data = vec![
+            (self.tp_udhi as u8) << 6
+                | (self.tp_srq as u8) << 5
+                | (self.tp_lp as u8) << 3
+                | (self.tp_mms as u8) << 2
+                | MTI_STATUS_REPORT,
+            self.tp_mr,
+        ];
+        data.append(&mut self.tp_recipient_address.encode(false)?);
+        data.extend_from_slice(&encode_time(
+            &self.tp_service_centre_timestamp,
+            "TP-Service-Centre-Time-Stamp",
+        )?);
+        data.extend_from_slice(&encode_time(&self.tp_discharge_time, "TP-Discharge-Time")?);
+        data.push(self.tp_status);
+
+        match self.tp_parameter_indicator {
+            Some(indicator) => {
+                check_parameter_indicator(
+                    "SMS-STATUS-REPORT",
+                    indicator,
+                    self.tp_pid,
+                    self.tp_dcs,
+                    self.tp_user_data_length,
+                )?;
+                data.push(indicator);
+                encode_parameters(
+                    "SMS-STATUS-REPORT",
+                    self.tp_pid,
+                    self.tp_dcs,
+                    self.tp_user_data_length,
+                    &self.tp_user_data,
+                    &mut data,
+                )?;
+            }
+            None => {
+                if self.tp_pid.is_some()
+                    || self.tp_dcs.is_some()
+                    || self.tp_user_data_length.is_some()
+                    || !self.tp_user_data.is_empty()
+                {
+                    return Err(
+                        "SMS-STATUS-REPORT: optional parameters need a TP-Parameter-Indicator"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(data)
+    }
+
+    /// Decode an SMS-STATUS-REPORT TPDU per TS 23.040 §9.2.2.3.
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut cursor = Cursor::new(data);
+        let first_byte = read_octet(&mut cursor, "first octet")?;
+        if first_byte & 0x03 != MTI_STATUS_REPORT {
+            return Err(
+                format!("TP-MTI {} is not SMS-STATUS-REPORT (2)", first_byte & 0x03).into(),
+            );
+        }
+        let tp_mr = read_octet(&mut cursor, "TP-MR")?;
+        let tp_recipient_address =
+            decode_transfer_layer_address(&mut cursor, "TP-Recipient-Address")?;
+        let tp_service_centre_timestamp = decode_time(&mut cursor, "TP-SCTS")?;
+        let tp_discharge_time = decode_time(&mut cursor, "TP-Discharge-Time")?;
+        let tp_status = read_octet(&mut cursor, "TP-Status")?;
+
+        // TP-PI is optional as a whole: a report may end at TP-Status.
+        let tp_parameter_indicator = if remaining(&cursor) > 0 {
+            Some(decode_parameter_indicator(&mut cursor)?)
+        } else {
+            None
+        };
+        let parameters = decode_parameters(&mut cursor, tp_parameter_indicator.unwrap_or(0))?;
+        let OptionalParameters {
+            tp_pid,
+            tp_dcs,
+            tp_user_data_length,
+            tp_user_data,
+        } = parameters;
+
+        Ok(SmsStatusReport {
+            tp_udhi: bit(first_byte, 6),
+            tp_srq: bit(first_byte, 5),
+            tp_lp: bit(first_byte, 3),
+            tp_mms: bit(first_byte, 2),
+            tp_mr,
+            tp_recipient_address,
+            tp_service_centre_timestamp,
+            tp_discharge_time,
+            tp_status,
+            tp_parameter_indicator,
+            tp_pid,
+            tp_dcs,
+            tp_user_data_length,
+            tp_user_data,
+        })
+    }
+}
+
 // ── Relay-layer messages (TS 24.011 §7.3, §8.2) ──────────────────────────────
 
 /// RP-DATA, mobile station to network (TS 24.011 table 8.3).
@@ -1208,6 +1440,13 @@ pub const RP_DATA_NETWORK_TO_MS: u8 = 0b001;
 pub const RP_ACK_MS_TO_NETWORK: u8 = 0b010;
 /// RP-ACK, network to mobile station.
 pub const RP_ACK_NETWORK_TO_MS: u8 = 0b011;
+/// RP-ERROR, mobile station to network.
+pub const RP_ERROR_MS_TO_NETWORK: u8 = 0b100;
+/// RP-ERROR, network to mobile station.
+pub const RP_ERROR_NETWORK_TO_MS: u8 = 0b101;
+/// RP-SMMA, mobile station to network.
+pub const RP_SMMA_MS_TO_NETWORK: u8 = 0b110;
+
 /// RP-User-Data information element identifier (TS 24.011 §8.2.5.3).
 const RP_USER_DATA_ELEMENT_ID: u8 = 0x41;
 
@@ -1328,7 +1567,8 @@ impl RpDataMsToNetwork {
 }
 
 /// RP-DATA, network to mobile station (TS 24.011 §7.3.1.1), carrying an
-/// SMS-DELIVER.
+/// SMS-DELIVER. For the one carrying an SMS-STATUS-REPORT see
+/// [`RpDataNetworkToMsStatusReport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpDataNetworkToMs {
     pub rp_message_type: u8,
@@ -1352,6 +1592,71 @@ impl RpDataNetworkToMs {
             self.rp_destination_address.as_ref(),
             &self.sms_deliver.encode()?,
         )
+    }
+}
+
+/// RP-DATA, network to mobile station (TS 24.011 §7.3.1.1), carrying an
+/// SMS-STATUS-REPORT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpDataNetworkToMsStatusReport {
+    pub rp_message_type: u8,
+    pub rp_message_reference: u8,
+    pub rp_originator_address: Option<SMSAddress>,
+    pub rp_destination_address: Option<SMSAddress>,
+    pub sms_status_report: SmsStatusReport,
+}
+
+impl RpDataNetworkToMsStatusReport {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        check_message_type(
+            self.rp_message_type,
+            RP_DATA_NETWORK_TO_MS,
+            "RP-DATA (network to MS)",
+        )?;
+        encode_relay_data(
+            self.rp_message_type,
+            self.rp_message_reference,
+            self.rp_originator_address.as_ref(),
+            self.rp_destination_address.as_ref(),
+            &self.sms_status_report.encode()?,
+        )
+    }
+}
+
+/// What [`parse_rp_data_network_to_ms`] found inside the RP-DATA: the TPDU the
+/// network sends is told apart by its TP-MTI (TS 23.040 §9.2.3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpDataNetworkToMsMessage {
+    Deliver(RpDataNetworkToMs),
+    StatusReport(RpDataNetworkToMsStatusReport),
+}
+
+/// Parse an RP-DATA sent by the network (TS 24.011 §7.3.1.1), which carries
+/// either an SMS-DELIVER or an SMS-STATUS-REPORT.
+pub fn parse_rp_data_network_to_ms(data: &[u8]) -> Result<RpDataNetworkToMsMessage, Error> {
+    let relay = decode_relay_data(data, RP_DATA_NETWORK_TO_MS, "RP-DATA (network to MS)")?;
+    let tp_mti = relay.tpdu.first().map(|octet| octet & 0x03);
+    match tp_mti {
+        Some(MTI_STATUS_REPORT) => Ok(RpDataNetworkToMsMessage::StatusReport(
+            RpDataNetworkToMsStatusReport {
+                rp_message_type: relay.rp_message_type,
+                rp_message_reference: relay.rp_message_reference,
+                rp_originator_address: relay.rp_originator_address,
+                rp_destination_address: relay.rp_destination_address,
+                sms_status_report: SmsStatusReport::decode(&relay.tpdu)
+                    .map_err(|e| format!("Could not decode TPDU: {e}"))?,
+            },
+        )),
+        // Everything else goes to the SMS-DELIVER decoder, which turns down a
+        // TP-MTI other than 00.
+        _ => Ok(RpDataNetworkToMsMessage::Deliver(RpDataNetworkToMs {
+            rp_message_type: relay.rp_message_type,
+            rp_message_reference: relay.rp_message_reference,
+            rp_originator_address: relay.rp_originator_address,
+            rp_destination_address: relay.rp_destination_address,
+            sms_deliver: SmsDeliver::decode(&relay.tpdu)
+                .map_err(|e| format!("Could not decode TPDU: {e}"))?,
+        })),
     }
 }
 
@@ -1409,6 +1714,215 @@ impl RpAck {
         ];
         encode_length_value("SMS-SUBMIT-REPORT", &report, &mut data)?;
         Ok(data)
+    }
+}
+
+/// RP-Cause and what may follow it in an RP-ERROR (TS 24.011 §7.3.4).
+struct RelayError {
+    rp_message_type: u8,
+    rp_message_reference: u8,
+    rp_cause: u8,
+    rp_diagnostic: Option<u8>,
+    tpdu: Option<Vec<u8>>,
+}
+
+fn encode_relay_error(
+    rp_message_type: u8,
+    rp_message_reference: u8,
+    rp_cause: u8,
+    rp_diagnostic: Option<u8>,
+    tpdu: Option<Vec<u8>>,
+) -> Result<Vec<u8>, Error> {
+    if rp_cause > 0x7F {
+        return Err(format!("RP-Cause value {rp_cause} does not fit its 7 bits").into());
+    }
+    let mut data = vec![
+        rp_message_type,
+        rp_message_reference,
+        // RP-Cause is LV: one octet of cause, optionally one of diagnostic.
+        if rp_diagnostic.is_some() { 2 } else { 1 },
+        rp_cause,
+    ];
+    data.extend(rp_diagnostic);
+    if let Some(tpdu) = tpdu {
+        data.push(RP_USER_DATA_ELEMENT_ID);
+        encode_length_value("TPDU", &tpdu, &mut data)?;
+    }
+    Ok(data)
+}
+
+fn decode_relay_error(data: &[u8], expected: u8, name: &str) -> Result<RelayError, Error> {
+    let mut cursor = Cursor::new(data);
+    let (rp_message_type, rp_message_reference) = decode_relay_header(&mut cursor, expected, name)?;
+
+    let cause_length = usize::from(read_octet(&mut cursor, "RP-Cause length")?);
+    let cause = read_octets(&mut cursor, cause_length, "RP-Cause")?;
+    let rp_cause = cause.first().ok_or("RP-Cause is empty")? & 0x7F;
+    let rp_diagnostic = cause.get(1).copied();
+
+    let tpdu = if remaining(&cursor) > 0 {
+        let element_id = read_octet(&mut cursor, "information element identifier")?;
+        if element_id == RP_USER_DATA_ELEMENT_ID {
+            let length = read_octet(&mut cursor, "RP-User-Data length")?;
+            Some(read_octets(
+                &mut cursor,
+                usize::from(length),
+                "RP-User-Data",
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(RelayError {
+        rp_message_type,
+        rp_message_reference,
+        rp_cause,
+        rp_diagnostic,
+        tpdu,
+    })
+}
+
+/// RP-ERROR, network to mobile station (TS 24.011 §7.3.4): the network turning
+/// down an RP-DATA or RP-SMMA from the mobile station.
+///
+/// `rp_cause` is the 7-bit cause value of table 8.4, `rp_diagnostic` the
+/// optional diagnostic octet behind it. The optional RP-User-Data carries the
+/// SMS-SUBMIT-REPORT for RP-ERROR of TS 23.040 §9.2.2.2a, so the report must
+/// have a `tp_failure_cause`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpErrorNetworkToMs {
+    pub rp_message_type: u8,
+    pub rp_message_reference: u8,
+    pub rp_cause: u8,
+    pub rp_diagnostic: Option<u8>,
+    pub sms_submit_report: Option<SmsSubmitReport>,
+}
+
+impl RpErrorNetworkToMs {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        check_message_type(
+            self.rp_message_type,
+            RP_ERROR_NETWORK_TO_MS,
+            "RP-ERROR (network to MS)",
+        )?;
+        let tpdu = match &self.sms_submit_report {
+            Some(report) if report.tp_failure_cause.is_none() => {
+                return Err("the SMS-SUBMIT-REPORT of an RP-ERROR needs a TP-Failure-Cause".into());
+            }
+            Some(report) => Some(report.encode()?),
+            None => None,
+        };
+        encode_relay_error(
+            self.rp_message_type,
+            self.rp_message_reference,
+            self.rp_cause,
+            self.rp_diagnostic,
+            tpdu,
+        )
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let relay = decode_relay_error(data, RP_ERROR_NETWORK_TO_MS, "RP-ERROR (network to MS)")?;
+        let sms_submit_report = relay
+            .tpdu
+            .map(|tpdu| {
+                SmsSubmitReport::decode_for_rp_error(&tpdu)
+                    .map_err(|e| format!("Could not decode TPDU: {e}"))
+            })
+            .transpose()?;
+        Ok(RpErrorNetworkToMs {
+            rp_message_type: relay.rp_message_type,
+            rp_message_reference: relay.rp_message_reference,
+            rp_cause: relay.rp_cause,
+            rp_diagnostic: relay.rp_diagnostic,
+            sms_submit_report,
+        })
+    }
+}
+
+/// RP-ERROR, mobile station to network (TS 24.011 §7.3.4): the mobile station
+/// turning down an RP-DATA from the network.
+///
+/// The optional RP-User-Data carries the SMS-DELIVER-REPORT for RP-ERROR of
+/// TS 23.040 §9.2.2.1a, so the report must have a `tp_failure_cause`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpErrorMsToNetwork {
+    pub rp_message_type: u8,
+    pub rp_message_reference: u8,
+    pub rp_cause: u8,
+    pub rp_diagnostic: Option<u8>,
+    pub sms_deliver_report: Option<SmsDeliverReport>,
+}
+
+impl RpErrorMsToNetwork {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        check_message_type(
+            self.rp_message_type,
+            RP_ERROR_MS_TO_NETWORK,
+            "RP-ERROR (MS to network)",
+        )?;
+        let tpdu = match &self.sms_deliver_report {
+            Some(report) if report.tp_failure_cause.is_none() => {
+                return Err(
+                    "the SMS-DELIVER-REPORT of an RP-ERROR needs a TP-Failure-Cause".into(),
+                );
+            }
+            Some(report) => Some(report.encode()?),
+            None => None,
+        };
+        encode_relay_error(
+            self.rp_message_type,
+            self.rp_message_reference,
+            self.rp_cause,
+            self.rp_diagnostic,
+            tpdu,
+        )
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let relay = decode_relay_error(data, RP_ERROR_MS_TO_NETWORK, "RP-ERROR (MS to network)")?;
+        let sms_deliver_report = relay
+            .tpdu
+            .map(|tpdu| {
+                SmsDeliverReport::decode_for_rp_error(&tpdu)
+                    .map_err(|e| format!("Could not decode TPDU: {e}"))
+            })
+            .transpose()?;
+        Ok(RpErrorMsToNetwork {
+            rp_message_type: relay.rp_message_type,
+            rp_message_reference: relay.rp_message_reference,
+            rp_cause: relay.rp_cause,
+            rp_diagnostic: relay.rp_diagnostic,
+            sms_deliver_report,
+        })
+    }
+}
+
+/// RP-SMMA (TS 24.011 §7.3.2): the mobile station telling the network it has
+/// memory available again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpSmma {
+    pub rp_message_type: u8,
+    pub rp_message_reference: u8,
+}
+
+impl RpSmma {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        check_message_type(self.rp_message_type, RP_SMMA_MS_TO_NETWORK, "RP-SMMA")?;
+        Ok(vec![self.rp_message_type, self.rp_message_reference])
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let mut cursor = Cursor::new(data);
+        let (rp_message_type, rp_message_reference) =
+            decode_relay_header(&mut cursor, RP_SMMA_MS_TO_NETWORK, "RP-SMMA")?;
+        Ok(RpSmma {
+            rp_message_type,
+            rp_message_reference,
+        })
     }
 }
 

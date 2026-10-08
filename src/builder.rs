@@ -22,8 +22,10 @@
 
 use crate::{
     pack_gsm7, pack_gsm7_with_header, Error, RpAck, RpDataMsToNetwork, RpDataNetworkToMs,
-    SMSAddress, SmsDeliver, SmsSubmit, SmsSubmitReport, UserDataHeader, ValidityPeriod,
-    RP_ACK_NETWORK_TO_MS, RP_DATA_MS_TO_NETWORK, RP_DATA_NETWORK_TO_MS,
+    RpDataNetworkToMsStatusReport, RpErrorMsToNetwork, RpErrorNetworkToMs, RpSmma, SMSAddress,
+    SmsDeliver, SmsDeliverReport, SmsStatusReport, SmsSubmit, SmsSubmitReport, UserDataHeader,
+    ValidityPeriod, RP_ACK_NETWORK_TO_MS, RP_DATA_MS_TO_NETWORK, RP_DATA_NETWORK_TO_MS,
+    RP_ERROR_MS_TO_NETWORK, RP_ERROR_NETWORK_TO_MS, RP_SMMA_MS_TO_NETWORK,
 };
 
 /// UTF-16BE encode a string into UCS-2 user-data bytes (TS 23.038 §6.2.3).
@@ -608,6 +610,202 @@ impl SmsSubmitReportBuilder {
     }
 }
 
+// ── SmsDeliverReport ─────────────────────────────────────────────────────────
+
+impl SmsDeliverReport {
+    /// Start building an [`SmsDeliverReport`]. All fields default to
+    /// `false`/`0`/absent, which is the layout for an RP-ACK; give it a
+    /// [`failure_cause`](SmsDeliverReportBuilder::failure_cause) for an
+    /// RP-ERROR.
+    pub fn builder() -> SmsDeliverReportBuilder {
+        SmsDeliverReportBuilder::default()
+    }
+}
+
+/// Builder for [`SmsDeliverReport`]. See [`SmsDeliverReport::builder`].
+#[derive(Debug, Clone, Default)]
+pub struct SmsDeliverReportBuilder {
+    tp_udhi: bool,
+    tp_failure_cause: Option<u8>,
+    tp_parameter_indicator: u8,
+    tp_pid: Option<u8>,
+    tp_dcs: Option<u8>,
+    tp_user_data_length: Option<u8>,
+    tp_user_data: Vec<u8>,
+}
+
+impl SmsDeliverReportBuilder {
+    /// TP-User-Data-Header-Indicator.
+    pub fn udhi(mut self, v: bool) -> Self {
+        self.tp_udhi = v;
+        self
+    }
+    /// TP-Failure-Cause (TS 23.040 §9.2.3.22). Setting it makes this the
+    /// report an RP-ERROR carries; without it, the one an RP-ACK carries.
+    pub fn failure_cause(mut self, v: u8) -> Self {
+        self.tp_failure_cause = Some(v);
+        self
+    }
+    /// TP-Parameter-Indicator. Set the bit of every optional parameter you
+    /// supply — it is not implied.
+    pub fn parameter_indicator(mut self, v: u8) -> Self {
+        self.tp_parameter_indicator = v;
+        self
+    }
+    /// Optional TP-Protocol-Identifier (TP-PI bit 0).
+    pub fn pid(mut self, v: u8) -> Self {
+        self.tp_pid = Some(v);
+        self
+    }
+    /// Optional TP-Data-Coding-Scheme (TP-PI bit 1).
+    pub fn dcs(mut self, v: u8) -> Self {
+        self.tp_dcs = Some(v);
+        self
+    }
+    /// Optional TP-User-Data-Length (TP-PI bit 2).
+    pub fn user_data_length(mut self, v: u8) -> Self {
+        self.tp_user_data_length = Some(v);
+        self
+    }
+    /// Optional TP-User-Data as it goes on the wire.
+    pub fn user_data(mut self, v: impl Into<Vec<u8>>) -> Self {
+        self.tp_user_data = v.into();
+        self
+    }
+    /// Finish and return the [`SmsDeliverReport`].
+    pub fn build(self) -> SmsDeliverReport {
+        SmsDeliverReport {
+            tp_udhi: self.tp_udhi,
+            tp_failure_cause: self.tp_failure_cause,
+            tp_parameter_indicator: self.tp_parameter_indicator,
+            tp_pid: self.tp_pid,
+            tp_dcs: self.tp_dcs,
+            tp_user_data_length: self.tp_user_data_length,
+            tp_user_data: self.tp_user_data,
+        }
+    }
+}
+
+// ── SmsStatusReport ──────────────────────────────────────────────────────────
+
+impl SmsStatusReport {
+    /// Start building an [`SmsStatusReport`] about a message that was headed
+    /// for `recipient_address`. Flags default to `false`, the reference and
+    /// status to `0`, the times to empty and the optional parameters to absent.
+    pub fn builder(recipient_address: SMSAddress) -> SmsStatusReportBuilder {
+        SmsStatusReportBuilder::new(recipient_address)
+    }
+}
+
+/// Builder for [`SmsStatusReport`]. See [`SmsStatusReport::builder`].
+#[derive(Debug, Clone)]
+pub struct SmsStatusReportBuilder {
+    report: SmsStatusReport,
+}
+
+impl SmsStatusReportBuilder {
+    fn new(recipient_address: SMSAddress) -> Self {
+        SmsStatusReportBuilder {
+            report: SmsStatusReport {
+                tp_udhi: false,
+                tp_srq: false,
+                tp_lp: false,
+                tp_mms: false,
+                tp_mr: 0,
+                tp_recipient_address: recipient_address,
+                tp_service_centre_timestamp: String::new(),
+                tp_discharge_time: String::new(),
+                tp_status: 0,
+                tp_parameter_indicator: None,
+                tp_pid: None,
+                tp_dcs: None,
+                tp_user_data_length: None,
+                tp_user_data: Vec::new(),
+            },
+        }
+    }
+
+    /// TP-User-Data-Header-Indicator.
+    pub fn udhi(mut self, v: bool) -> Self {
+        self.report.tp_udhi = v;
+        self
+    }
+    /// TP-Status-Report-Qualifier: `false` for the result of an SMS-SUBMIT,
+    /// `true` for that of an SMS-COMMAND.
+    pub fn srq(mut self, v: bool) -> Self {
+        self.report.tp_srq = v;
+        self
+    }
+    /// TP-Loop-Prevention.
+    pub fn lp(mut self, v: bool) -> Self {
+        self.report.tp_lp = v;
+        self
+    }
+    /// TP-More-Messages-to-Send. `true` sets the bit, which says no more
+    /// messages are waiting.
+    pub fn mms(mut self, v: bool) -> Self {
+        self.report.tp_mms = v;
+        self
+    }
+    /// TP-Message-Reference of the SMS-SUBMIT this report is about.
+    pub fn mr(mut self, v: u8) -> Self {
+        self.report.tp_mr = v;
+        self
+    }
+    /// TP-Recipient-Address (also settable via [`SmsStatusReport::builder`]).
+    pub fn recipient_address(mut self, v: SMSAddress) -> Self {
+        self.report.tp_recipient_address = v;
+        self
+    }
+    /// TP-Service-Centre-Time-Stamp digit string (see
+    /// [`SmsDeliverBuilder::service_centre_timestamp`]).
+    pub fn service_centre_timestamp(mut self, v: impl Into<String>) -> Self {
+        self.report.tp_service_centre_timestamp = v.into();
+        self
+    }
+    /// TP-Discharge-Time, in the same 14 digits.
+    pub fn discharge_time(mut self, v: impl Into<String>) -> Self {
+        self.report.tp_discharge_time = v.into();
+        self
+    }
+    /// TP-Status (TS 23.040 §9.2.3.15).
+    pub fn status(mut self, v: u8) -> Self {
+        self.report.tp_status = v;
+        self
+    }
+    /// TP-Parameter-Indicator. Without it the report ends at TP-Status. Set
+    /// the bit of every optional parameter you supply — it is not implied.
+    pub fn parameter_indicator(mut self, v: u8) -> Self {
+        self.report.tp_parameter_indicator = Some(v);
+        self
+    }
+    /// Optional TP-Protocol-Identifier (TP-PI bit 0).
+    pub fn pid(mut self, v: u8) -> Self {
+        self.report.tp_pid = Some(v);
+        self
+    }
+    /// Optional TP-Data-Coding-Scheme (TP-PI bit 1).
+    pub fn dcs(mut self, v: u8) -> Self {
+        self.report.tp_dcs = Some(v);
+        self
+    }
+    /// Optional TP-User-Data-Length (TP-PI bit 2).
+    pub fn user_data_length(mut self, v: u8) -> Self {
+        self.report.tp_user_data_length = Some(v);
+        self
+    }
+    /// Optional TP-User-Data as it goes on the wire.
+    pub fn user_data(mut self, v: impl Into<Vec<u8>>) -> Self {
+        self.report.tp_user_data = v.into();
+        self
+    }
+    /// Finish and return the [`SmsStatusReport`]. Encode it with
+    /// [`SmsStatusReport::encode`].
+    pub fn build(self) -> SmsStatusReport {
+        self.report
+    }
+}
+
 // ── RpDataMsToNetwork ────────────────────────────────────────────────────────
 
 impl RpDataMsToNetwork {
@@ -746,6 +944,73 @@ impl RpDataNetworkToMsBuilder {
     }
 }
 
+// ── RpDataNetworkToMsStatusReport ────────────────────────────────────────────
+
+impl RpDataNetworkToMsStatusReport {
+    /// Start building an MT RP-DATA around an [`SmsStatusReport`].
+    /// RP-Message-Type defaults to `1` (RP-DATA Network→MS);
+    /// references/addresses default to `0`/absent.
+    pub fn builder(sms_status_report: SmsStatusReport) -> RpDataNetworkToMsStatusReportBuilder {
+        RpDataNetworkToMsStatusReportBuilder {
+            rp_message_type: RP_DATA_NETWORK_TO_MS,
+            rp_message_reference: 0,
+            rp_originator_address: None,
+            rp_destination_address: None,
+            sms_status_report,
+        }
+    }
+}
+
+/// Builder for [`RpDataNetworkToMsStatusReport`]. See
+/// [`RpDataNetworkToMsStatusReport::builder`].
+#[derive(Debug, Clone)]
+pub struct RpDataNetworkToMsStatusReportBuilder {
+    rp_message_type: u8,
+    rp_message_reference: u8,
+    rp_originator_address: Option<SMSAddress>,
+    rp_destination_address: Option<SMSAddress>,
+    sms_status_report: SmsStatusReport,
+}
+
+impl RpDataNetworkToMsStatusReportBuilder {
+    /// RP-Message-Type (defaults to `1`, RP-DATA Network→MS).
+    pub fn message_type(mut self, v: u8) -> Self {
+        self.rp_message_type = v;
+        self
+    }
+    /// RP-Message-Reference.
+    pub fn message_reference(mut self, v: u8) -> Self {
+        self.rp_message_reference = v;
+        self
+    }
+    /// RP-Originator-Address (the service centre).
+    pub fn originator_address(mut self, v: SMSAddress) -> Self {
+        self.rp_originator_address = Some(v);
+        self
+    }
+    /// RP-Destination-Address.
+    pub fn destination_address(mut self, v: SMSAddress) -> Self {
+        self.rp_destination_address = Some(v);
+        self
+    }
+    /// Replace the wrapped [`SmsStatusReport`].
+    pub fn sms_status_report(mut self, v: SmsStatusReport) -> Self {
+        self.sms_status_report = v;
+        self
+    }
+    /// Finish and return the [`RpDataNetworkToMsStatusReport`]. Encode it with
+    /// [`RpDataNetworkToMsStatusReport::encode`].
+    pub fn build(self) -> RpDataNetworkToMsStatusReport {
+        RpDataNetworkToMsStatusReport {
+            rp_message_type: self.rp_message_type,
+            rp_message_reference: self.rp_message_reference,
+            rp_originator_address: self.rp_originator_address,
+            rp_destination_address: self.rp_destination_address,
+            sms_status_report: self.sms_status_report,
+        }
+    }
+}
+
 // ── RpAck ────────────────────────────────────────────────────────────────────
 
 impl RpAck {
@@ -820,6 +1085,164 @@ impl RpAckBuilder {
             rp_user_data_element_id: self.rp_user_data_element_id,
             rp_user_data_element_length,
             sms_submit_report: self.sms_submit_report,
+        }
+    }
+}
+
+// ── RpErrorNetworkToMs ───────────────────────────────────────────────────────
+
+impl RpErrorNetworkToMs {
+    /// Start building an RP-ERROR Network→MS with the given RP-Cause value
+    /// (TS 24.011 table 8.4). RP-Message-Type defaults to `5`, the reference to
+    /// `0`, the diagnostic and the SMS-SUBMIT-REPORT to absent.
+    pub fn builder(cause: u8) -> RpErrorNetworkToMsBuilder {
+        RpErrorNetworkToMsBuilder {
+            error: RpErrorNetworkToMs {
+                rp_message_type: RP_ERROR_NETWORK_TO_MS,
+                rp_message_reference: 0,
+                rp_cause: cause,
+                rp_diagnostic: None,
+                sms_submit_report: None,
+            },
+        }
+    }
+}
+
+/// Builder for [`RpErrorNetworkToMs`]. See [`RpErrorNetworkToMs::builder`].
+#[derive(Debug, Clone)]
+pub struct RpErrorNetworkToMsBuilder {
+    error: RpErrorNetworkToMs,
+}
+
+impl RpErrorNetworkToMsBuilder {
+    /// RP-Message-Type (defaults to `5`, RP-ERROR Network→MS).
+    pub fn message_type(mut self, v: u8) -> Self {
+        self.error.rp_message_type = v;
+        self
+    }
+    /// RP-Message-Reference (echoes the RP-DATA or RP-SMMA it turns down).
+    pub fn message_reference(mut self, v: u8) -> Self {
+        self.error.rp_message_reference = v;
+        self
+    }
+    /// RP-Cause value (also settable via [`RpErrorNetworkToMs::builder`]).
+    pub fn cause(mut self, v: u8) -> Self {
+        self.error.rp_cause = v;
+        self
+    }
+    /// The diagnostic octet behind the cause value.
+    pub fn diagnostic(mut self, v: u8) -> Self {
+        self.error.rp_diagnostic = Some(v);
+        self
+    }
+    /// The SMS-SUBMIT-REPORT to carry as RP-User-Data. It needs a
+    /// TP-Failure-Cause.
+    pub fn sms_submit_report(mut self, v: SmsSubmitReport) -> Self {
+        self.error.sms_submit_report = Some(v);
+        self
+    }
+    /// Finish and return the [`RpErrorNetworkToMs`]. Encode it with
+    /// [`RpErrorNetworkToMs::encode`].
+    pub fn build(self) -> RpErrorNetworkToMs {
+        self.error
+    }
+}
+
+// ── RpErrorMsToNetwork ───────────────────────────────────────────────────────
+
+impl RpErrorMsToNetwork {
+    /// Start building an RP-ERROR MS→Network with the given RP-Cause value
+    /// (TS 24.011 table 8.4). RP-Message-Type defaults to `4`, the reference to
+    /// `0`, the diagnostic and the SMS-DELIVER-REPORT to absent.
+    pub fn builder(cause: u8) -> RpErrorMsToNetworkBuilder {
+        RpErrorMsToNetworkBuilder {
+            error: RpErrorMsToNetwork {
+                rp_message_type: RP_ERROR_MS_TO_NETWORK,
+                rp_message_reference: 0,
+                rp_cause: cause,
+                rp_diagnostic: None,
+                sms_deliver_report: None,
+            },
+        }
+    }
+}
+
+/// Builder for [`RpErrorMsToNetwork`]. See [`RpErrorMsToNetwork::builder`].
+#[derive(Debug, Clone)]
+pub struct RpErrorMsToNetworkBuilder {
+    error: RpErrorMsToNetwork,
+}
+
+impl RpErrorMsToNetworkBuilder {
+    /// RP-Message-Type (defaults to `4`, RP-ERROR MS→Network).
+    pub fn message_type(mut self, v: u8) -> Self {
+        self.error.rp_message_type = v;
+        self
+    }
+    /// RP-Message-Reference (echoes the RP-DATA it turns down).
+    pub fn message_reference(mut self, v: u8) -> Self {
+        self.error.rp_message_reference = v;
+        self
+    }
+    /// RP-Cause value (also settable via [`RpErrorMsToNetwork::builder`]).
+    pub fn cause(mut self, v: u8) -> Self {
+        self.error.rp_cause = v;
+        self
+    }
+    /// The diagnostic octet behind the cause value.
+    pub fn diagnostic(mut self, v: u8) -> Self {
+        self.error.rp_diagnostic = Some(v);
+        self
+    }
+    /// The SMS-DELIVER-REPORT to carry as RP-User-Data. It needs a
+    /// TP-Failure-Cause.
+    pub fn sms_deliver_report(mut self, v: SmsDeliverReport) -> Self {
+        self.error.sms_deliver_report = Some(v);
+        self
+    }
+    /// Finish and return the [`RpErrorMsToNetwork`]. Encode it with
+    /// [`RpErrorMsToNetwork::encode`].
+    pub fn build(self) -> RpErrorMsToNetwork {
+        self.error
+    }
+}
+
+// ── RpSmma ───────────────────────────────────────────────────────────────────
+
+impl RpSmma {
+    /// Start building an RP-SMMA. RP-Message-Type defaults to `6`, the
+    /// reference to `0`.
+    pub fn builder() -> RpSmmaBuilder {
+        RpSmmaBuilder {
+            rp_message_type: RP_SMMA_MS_TO_NETWORK,
+            rp_message_reference: 0,
+        }
+    }
+}
+
+/// Builder for [`RpSmma`]. See [`RpSmma::builder`].
+#[derive(Debug, Clone)]
+pub struct RpSmmaBuilder {
+    rp_message_type: u8,
+    rp_message_reference: u8,
+}
+
+impl RpSmmaBuilder {
+    /// RP-Message-Type (defaults to `6`, RP-SMMA).
+    pub fn message_type(mut self, v: u8) -> Self {
+        self.rp_message_type = v;
+        self
+    }
+    /// RP-Message-Reference.
+    pub fn message_reference(mut self, v: u8) -> Self {
+        self.rp_message_reference = v;
+        self
+    }
+    /// Finish and return the [`RpSmma`]. Encode it with [`RpSmma::encode`].
+    pub fn build(self) -> RpSmma {
+        RpSmma {
+            rp_message_type: self.rp_message_type,
+            rp_message_reference: self.rp_message_reference,
         }
     }
 }
