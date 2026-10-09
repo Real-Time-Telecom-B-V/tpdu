@@ -24,8 +24,13 @@
 //! Coverage is chosen so that a regression cannot hide: the base alphabet, the
 //! national block at 0x00-0x1F, the Greek block, the escape table (each of
 //! `^{}[]~|€` costing two septets), and the septet boundary at exactly 7
-//! characters, where TS 23.038 §6.1.2.3.1 requires the 7 spare bits to be
-//! padded with CR (0x0D) rather than zeros.
+//! characters, where 7 spare bits are left over.
+//!
+//! Spare bits are zero. TS 23.038 §6.1.2.1.1 packs SMS "by completing the
+//! octets with zeros on the left" and draws seven characters in seven octets
+//! with a last octet of `0 0 0 0 0 0 0 7a`. Filling the spare bits with CR
+//! (0x0D) is the USSD rule of §6.1.2.3.1 and does not apply to SMS, where
+//! TP-UDL already says how many septets there are.
 
 use tpdu::{pack_gsm7, unpack_gsm7};
 
@@ -35,9 +40,9 @@ const VECTORS: &[(&str, usize, &str)] = &[
     ("hellohello", 10, "e8329bfd4697d9ec37"),
     // 5 septets: 35 bits, so 5 octets with 5 spare bits zero-padded.
     ("hello", 5, "e8329bfd06"),
-    // 7 septets: exactly 49 bits. One bit short of 7 octets, so the spare 7
-    // bits carry CR (0x0D) per TS 23.038 §6.1.2.3.1, not zeros. A packer that
-    // zero-pads here produces ...dd00 -> a trailing '@' on a strict decoder.
+    // 7 septets: 49 bits in 7 octets, so 7 spare bits, all zero per
+    // TS 23.038 §6.1.2.1.1 ("0 0 0 0 0 0 0 7a"). The last octet holds only the
+    // top bit of '7' (0x37), which is 0.
     ("1234567", 7, "31d98c56b3dd00"),
     // The 0x00-0x1F national block: @ £ $ ¥ è é ù ì are code points 0x00-0x07.
     ("@£$¥èéùì", 8, "8080604028180e"),
@@ -49,8 +54,11 @@ const VECTORS: &[(&str, usize, &str)] = &[
         24,
         "e10d45bc418d3729f28657def8cc9bde7903446fca",
     ),
-    // Nordic and the upper-case national characters, plus § and ¿.
-    ("Ærøskøbing ÄÖÑÜ§¿", 17, "1c3963be6688d3ee3368cbed7abfe0"),
+    // Nordic and the upper-case national characters, plus § and ¿. 17 septets
+    // are 119 bits, one short of 15 octets: the last octet is '¿' (0x60) with
+    // the spare bit 7 clear. Up to 1.0.1 that bit was set (...e0), a stray bit
+    // of padding that §6.1.2.1.1 has as zero.
+    ("Ærøskøbing ÄÖÑÜ§¿", 17, "1c3963be6688d3ee3368cbed7abf60"),
 ];
 
 #[test]
@@ -84,17 +92,15 @@ fn unpack_gsm7_reads_the_validated_vectors_back() {
 }
 
 #[test]
-fn the_seven_septet_boundary_pads_with_cr_not_zero() {
+fn the_seven_septet_boundary_pads_with_zeros() {
     // Called out on its own because it is the single easiest thing to get wrong
     // and the hardest to notice: it only bites when the septet count mod 8 is 7.
     let (packed, septets) = pack_gsm7("1234567").expect("pack_gsm7");
     assert_eq!(septets, 7);
     assert_eq!(packed.len(), 7, "7 septets occupy 49 bits, so 7 octets");
-    // The final octet holds the last septet's spare bit plus the CR pad.
-    assert_eq!(
-        packed[6], 0x00,
-        "the top bit of septet 7 plus a CR pad shifted into place"
-    );
+    // The final octet holds the top bit of the seventh septet and seven spare
+    // bits, which TS 23.038 §6.1.2.1.1 has as zeros.
+    assert_eq!(packed[6], 0x00, "the top bit of septet 7, then zero fill");
     assert_eq!(hex::encode(&packed), "31d98c56b3dd00");
 }
 
