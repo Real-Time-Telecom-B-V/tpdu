@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [2.0.0] - 2026-10-08
+## [2.0.0] - 2026-10-09
 
 Wire-correctness release. Several fields were read from, or written to, the
 wrong place; each entry below says what was on the wire before. Two of the fixes
