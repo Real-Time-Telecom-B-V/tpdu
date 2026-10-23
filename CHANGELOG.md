@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **RP-ACK** in both directions, encode and decode (TS 24.011 §7.3.3):
+  `RpAckMsToNetwork` with an optional SMS-DELIVER-REPORT and
+  `RpAckNetworkToMs` with an optional SMS-SUBMIT-REPORT, each with a
+  `builder()`. The decoders refuse an RP-Message-Type of the other direction,
+  an information element other than RP-User-Data, an RP-User-Data that is
+  empty or runs past the message, octets after it, and a TPDU of the wrong
+  type. `RpAck` stays as it was and converts with `RpAckNetworkToMs::from`.
+- Python: `RpAckMsToNetwork` and its builder, `parse_rp_ack`, and getters on
+  `RpAckNetworkToMs`, whose `sms_submit_report` is now optional.
+
 ## [2.0.0] - 2026-10-09
 
 Wire-correctness release. Several fields were read from, or written to, the

@@ -157,6 +157,27 @@ let wire = RpDataNetworkToMsStatusReport::builder(status).build().encode()?;
 # Ok::<(), tpdu::Error>(())
 ```
 
+Acknowledging an MT RP-DATA from the handset side, and reading the network's
+RP-ACK for an MO one:
+
+```rust
+use tpdu::{RpAckMsToNetwork, RpAckNetworkToMs, SmsDeliverReport};
+
+// RP-ACK MS→Network for the RP-DATA with RP-MR 7, with an SMS-DELIVER-REPORT.
+let wire = RpAckMsToNetwork::builder()
+    .message_reference(7)
+    .sms_deliver_report(SmsDeliverReport::builder().build())
+    .build()
+    .encode()?;
+assert_eq!(wire, [0x02, 0x07, 0x41, 0x02, 0x00, 0x00]);
+
+// RP-ACK Network→MS, RP-User-Data optional.
+let ack = RpAckNetworkToMs::decode(&[0x03, 0x07])?;
+assert_eq!(ack.rp_message_reference, 7);
+assert!(ack.sms_submit_report.is_none());
+# Ok::<(), tpdu::Error>(())
+```
+
 ## Quick start — Python
 
 The Python API is ergonomic and slightly higher-level than the Rust one
@@ -218,6 +239,11 @@ body = tpdu.RpErrorNetworkToMs(21, rp_message_reference=7, sms_submit_report=rep
 error = tpdu.parse_rp_error(rp_error_bytes)
 print(error.rp_cause, error.rp_diagnostic)
 
+# RP-ACK in either direction: RpAckMsToNetwork or RpAckNetworkToMs.
+ack = tpdu.parse_rp_ack(rp_ack_bytes)
+print(ack.rp_message_reference)
+body = tpdu.RpAckMsToNetwork(tpdu.SmsDeliverReport(), rp_message_reference=7).encode()
+
 # A status report for the SMS-SUBMIT that had TP-MR 42.
 status = tpdu.SmsStatusReport(tpdu.Address("15550100"), tp_mr=42, tp_status=0x00)
 body = tpdu.RpDataNetworkToMsStatusReport(status).encode()
@@ -239,7 +265,7 @@ Derived from the implementation — not aspirational.
 | **SMS-DELIVER-REPORT** (TS 23.040 §9.2.2.1a) | MO | encode / decode | both layouts: for RP-ACK, and for RP-ERROR with TP-FCS; TP-PI, optional TP-PID / TP-DCS / TP-UD |
 | **RP-DATA** MS→Network (TS 24.011 §7.3.1.2) | MO | encode / decode | RP-MR, RP-OA / RP-DA, wrapped SMS-SUBMIT |
 | **RP-DATA** Network→MS (TS 24.011 §7.3.1.1) | MT | encode / decode | RP-MR, RP-OA / RP-DA, wrapped SMS-DELIVER or SMS-STATUS-REPORT |
-| **RP-ACK** Network→MS (TS 24.011 §7.3.3) | MT | encode | echoes inbound RP-MR; RP-User-Data IE carries SMS-SUBMIT-REPORT |
+| **RP-ACK** (TS 24.011 §7.3.3) | both | encode / decode | RP-MR; optional RP-User-Data IE carries SMS-SUBMIT-REPORT (Network→MS) or SMS-DELIVER-REPORT (MS→Network) |
 | **RP-ERROR** (TS 24.011 §7.3.4) | both | encode / decode | RP-Cause with optional diagnostic; RP-User-Data IE carries SMS-SUBMIT-REPORT (Network→MS) or SMS-DELIVER-REPORT (MS→Network) |
 | **RP-SMMA** (TS 24.011 §7.3.2) | MO | encode / decode | RP-MR |
 | **GSM 7-bit** (TS 23.038 §6.1.2.1.1, §6.2.1) | — | pack / unpack | default alphabet and its extension table (`^{}\[~]|€`, FF: 2 septets each); zero fill; with or without a user-data header |
@@ -249,7 +275,7 @@ Derived from the implementation — not aspirational.
 | **SMS addresses** (TS 23.040 §9.1.2.5) | — | encode / decode | BCD digits incl. `*`, `#`, `a`, `b`, `c`, and GSM-7 alphanumeric (TON=5); TON/NPI preserved |
 | **Time stamps** (TS 23.040 §9.2.3.11) | — | encode / decode | TP-SCTS, TP-DT and absolute TP-VP as 14 semi-octet digits; `timestamp_digits` builds them, negative time zones included |
 
-Not covered: SMS-COMMAND, decoding an RP-ACK (either direction), the national
+Not covered: SMS-COMMAND, the national
 language shift tables of TS 23.038 §6.2.1.2 (the header elements pass through
 as octets, the text is read with the default alphabet), and compressed user
 data (TS 23.042), which is carried as octets and not unpacked.
@@ -264,7 +290,8 @@ that carry these PDUs.
 `UserDataCoding`, `SmsSubmit`, `SmsDeliver`, `SmsStatusReport`,
 `SmsSubmitReport`, `SmsDeliverReport`, `RpDataMsToNetwork`,
 `RpDataNetworkToMs`, `RpDataNetworkToMsStatusReport`,
-`RpDataNetworkToMsMessage`, `RpAck`, `RpErrorNetworkToMs`,
+`RpDataNetworkToMsMessage`, `RpAck`, `RpAckNetworkToMs`, `RpAckMsToNetwork`,
+`RpErrorNetworkToMs`,
 `RpErrorMsToNetwork`, `RpSmma`, `Error`; functions `parse_rp_data`,
 `parse_rp_data_network_to_ms`, `decode_sms_submit_tpdu`, `pack_gsm7`,
 `unpack_gsm7`, `pack_gsm7_with_header`, `unpack_gsm7_with_header`,
@@ -275,9 +302,9 @@ every constructable type a fluent `::builder(..)`.
 **Python** — classes `Address`, `UserDataHeader`, `SmsSubmit`, `SmsDeliver`,
 `SmsStatusReport`, `SmsSubmitReport`, `SmsDeliverReport`, `RpData`,
 `RpDataNetworkToMs`, `RpDataNetworkToMsStatusReport`, `RpAckNetworkToMs`,
-`RpErrorNetworkToMs`, `RpErrorMsToNetwork`, `RpSmma`; functions
+`RpAckMsToNetwork`, `RpErrorNetworkToMs`, `RpErrorMsToNetwork`, `RpSmma`; functions
 `parse_rp_data`, `parse_rp_data_network_to_ms`, `parse_sms_submit`,
-`parse_sms_status_report`, `parse_rp_error`, `parse_rp_smma`,
+`parse_sms_status_report`, `parse_rp_error`, `parse_rp_ack`, `parse_rp_smma`,
 `destination_from_tpdu`, `build_sms_deliver_tpdu`, `pack_gsm7`, `unpack_gsm7`,
 `pack_gsm7_with_header`, `unpack_gsm7_with_header`, `user_data_coding`,
 `timestamp_digits`. Constructable classes also expose a fluent `.builder(..)`.

@@ -102,6 +102,73 @@ def test_rp_error_ms_to_network():
         tpdu.parse_rp_error(h("06 09"))
 
 
+# ── RP-ACK ──────────────────────────────────────────────────────────────
+
+# Type 2, RP-MR 7, RP-User-Data (IEI 0x41, length 2): SMS-DELIVER-REPORT with
+# TP-MTI 00, TP-PI 0.
+RP_ACK_FROM_MS = h("02 07 41 02 00 00")
+# Type 3, RP-MR 7, RP-User-Data (length 9): SMS-SUBMIT-REPORT with TP-PI 0 and
+# TP-SCTS.
+RP_ACK_TO_MS = h(f"03 07 41 09 01 00 {SCTS}")
+
+
+def test_rp_ack_ms_to_network():
+    ack = tpdu.RpAckMsToNetwork(tpdu.SmsDeliverReport(), rp_message_reference=7)
+    assert ack.encode() == RP_ACK_FROM_MS
+    fluent = (
+        tpdu.RpAckMsToNetwork.builder()
+        .message_reference(7)
+        .sms_deliver_report(tpdu.SmsDeliverReport.builder().build())
+        .build()
+    )
+    assert fluent.encode() == RP_ACK_FROM_MS
+    assert tpdu.RpAckMsToNetwork(rp_message_reference=7).encode() == h("02 07")
+
+    parsed = tpdu.parse_rp_ack(RP_ACK_FROM_MS)
+    assert isinstance(parsed, tpdu.RpAckMsToNetwork)
+    assert parsed.rp_message_type == 2
+    assert parsed.rp_message_reference == 7
+    assert parsed.sms_deliver_report.tp_failure_cause is None
+    assert tpdu.parse_rp_ack(h("02 2a")).sms_deliver_report is None
+
+    # The report of an RP-ACK has no failure cause.
+    with pytest.raises(ValueError):
+        tpdu.RpAckMsToNetwork(
+            tpdu.SmsDeliverReport(tp_failure_cause=0xD3), rp_message_reference=7
+        ).encode()
+
+
+def test_rp_ack_network_to_ms():
+    report = tpdu.SmsSubmitReport(scts=SCTS_DIGITS)
+    assert tpdu.RpAckNetworkToMs(report, rp_message_reference=7).encode() == RP_ACK_TO_MS
+    assert tpdu.RpAckNetworkToMs(rp_message_reference=7).encode() == h("03 07")
+    assert tpdu.RpAckNetworkToMs.builder().message_reference(7).build().encode() == h("03 07")
+
+    parsed = tpdu.parse_rp_ack(RP_ACK_TO_MS)
+    assert isinstance(parsed, tpdu.RpAckNetworkToMs)
+    assert parsed.rp_message_type == 3
+    assert parsed.rp_message_reference == 7
+    assert parsed.sms_submit_report.scts == SCTS_DIGITS
+    assert tpdu.parse_rp_ack(h("03 07")).sms_submit_report is None
+
+
+def test_parse_rp_ack_refuses_what_is_not_one():
+    for message in [
+        "",
+        "02",
+        "05 07 01 15",
+        "02 07 41",
+        "02 07 41 03 00 00",
+        "02 07 41 00",
+        "02 07 42 02 00 00",
+        "02 07 41 02 00 00 ff",
+        f"02 07 41 09 01 00 {SCTS}",
+        "03 07 41 02 00 00",
+    ]:
+        with pytest.raises(ValueError):
+            tpdu.parse_rp_ack(h(message))
+
+
 def test_sms_deliver_report_for_rp_ack():
     assert tpdu.SmsDeliverReport().encode() == h("00 00")
     assert tpdu.SmsDeliverReport(tp_udhi=True, tp_parameter_indicator=1, tp_pid=0x7F).encode() == h(

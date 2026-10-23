@@ -21,11 +21,12 @@
 //! not add up rather than put it on the wire.
 
 use crate::{
-    pack_gsm7, pack_gsm7_with_header, Error, RpAck, RpDataMsToNetwork, RpDataNetworkToMs,
-    RpDataNetworkToMsStatusReport, RpErrorMsToNetwork, RpErrorNetworkToMs, RpSmma, SMSAddress,
-    SmsDeliver, SmsDeliverReport, SmsStatusReport, SmsSubmit, SmsSubmitReport, UserDataHeader,
-    ValidityPeriod, RP_ACK_NETWORK_TO_MS, RP_DATA_MS_TO_NETWORK, RP_DATA_NETWORK_TO_MS,
-    RP_ERROR_MS_TO_NETWORK, RP_ERROR_NETWORK_TO_MS, RP_SMMA_MS_TO_NETWORK,
+    pack_gsm7, pack_gsm7_with_header, Error, RpAck, RpAckMsToNetwork, RpAckNetworkToMs,
+    RpDataMsToNetwork, RpDataNetworkToMs, RpDataNetworkToMsStatusReport, RpErrorMsToNetwork,
+    RpErrorNetworkToMs, RpSmma, SMSAddress, SmsDeliver, SmsDeliverReport, SmsStatusReport,
+    SmsSubmit, SmsSubmitReport, UserDataHeader, ValidityPeriod, RP_ACK_MS_TO_NETWORK,
+    RP_ACK_NETWORK_TO_MS, RP_DATA_MS_TO_NETWORK, RP_DATA_NETWORK_TO_MS, RP_ERROR_MS_TO_NETWORK,
+    RP_ERROR_NETWORK_TO_MS, RP_SMMA_MS_TO_NETWORK,
 };
 
 /// UTF-16BE encode a string into UCS-2 user-data bytes (TS 23.038 §6.2.3).
@@ -1086,6 +1087,98 @@ impl RpAckBuilder {
             rp_user_data_element_length,
             sms_submit_report: self.sms_submit_report,
         }
+    }
+}
+
+// ── RpAckMsToNetwork ─────────────────────────────────────────────────────────
+
+impl RpAckMsToNetwork {
+    /// Start building an RP-ACK MS→Network. RP-Message-Type defaults to `2`,
+    /// the reference to `0` and the SMS-DELIVER-REPORT to absent.
+    pub fn builder() -> RpAckMsToNetworkBuilder {
+        RpAckMsToNetworkBuilder {
+            ack: RpAckMsToNetwork {
+                rp_message_type: RP_ACK_MS_TO_NETWORK,
+                rp_message_reference: 0,
+                sms_deliver_report: None,
+            },
+        }
+    }
+}
+
+/// Builder for [`RpAckMsToNetwork`]. See [`RpAckMsToNetwork::builder`].
+#[derive(Debug, Clone)]
+pub struct RpAckMsToNetworkBuilder {
+    ack: RpAckMsToNetwork,
+}
+
+impl RpAckMsToNetworkBuilder {
+    /// RP-Message-Type (defaults to `2`, RP-ACK MS→Network).
+    pub fn message_type(mut self, v: u8) -> Self {
+        self.ack.rp_message_type = v;
+        self
+    }
+    /// RP-Message-Reference (echoes the RP-DATA it acknowledges).
+    pub fn message_reference(mut self, v: u8) -> Self {
+        self.ack.rp_message_reference = v;
+        self
+    }
+    /// The SMS-DELIVER-REPORT to carry as RP-User-Data. It must not have a
+    /// TP-Failure-Cause.
+    pub fn sms_deliver_report(mut self, v: SmsDeliverReport) -> Self {
+        self.ack.sms_deliver_report = Some(v);
+        self
+    }
+    /// Finish and return the [`RpAckMsToNetwork`]. Encode it with
+    /// [`RpAckMsToNetwork::encode`].
+    pub fn build(self) -> RpAckMsToNetwork {
+        self.ack
+    }
+}
+
+// ── RpAckNetworkToMs ─────────────────────────────────────────────────────────
+
+impl RpAckNetworkToMs {
+    /// Start building an RP-ACK Network→MS. RP-Message-Type defaults to `3`,
+    /// the reference to `0` and the SMS-SUBMIT-REPORT to absent.
+    pub fn builder() -> RpAckNetworkToMsBuilder {
+        RpAckNetworkToMsBuilder {
+            ack: RpAckNetworkToMs {
+                rp_message_type: RP_ACK_NETWORK_TO_MS,
+                rp_message_reference: 0,
+                sms_submit_report: None,
+            },
+        }
+    }
+}
+
+/// Builder for [`RpAckNetworkToMs`]. See [`RpAckNetworkToMs::builder`].
+#[derive(Debug, Clone)]
+pub struct RpAckNetworkToMsBuilder {
+    ack: RpAckNetworkToMs,
+}
+
+impl RpAckNetworkToMsBuilder {
+    /// RP-Message-Type (defaults to `3`, RP-ACK Network→MS).
+    pub fn message_type(mut self, v: u8) -> Self {
+        self.ack.rp_message_type = v;
+        self
+    }
+    /// RP-Message-Reference (echoes the RP-DATA or RP-SMMA it acknowledges).
+    pub fn message_reference(mut self, v: u8) -> Self {
+        self.ack.rp_message_reference = v;
+        self
+    }
+    /// The SMS-SUBMIT-REPORT to carry as RP-User-Data. It must not have a
+    /// TP-Failure-Cause.
+    pub fn sms_submit_report(mut self, v: SmsSubmitReport) -> Self {
+        self.ack.sms_submit_report = Some(v);
+        self
+    }
+    /// Finish and return the [`RpAckNetworkToMs`]. Encode it with
+    /// [`RpAckNetworkToMs::encode`].
+    pub fn build(self) -> RpAckNetworkToMs {
+        self.ack
     }
 }
 
