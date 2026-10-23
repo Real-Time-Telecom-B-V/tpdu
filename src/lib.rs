@@ -25,10 +25,11 @@ use tracing::debug;
 
 mod builder;
 pub use builder::{
-    RpAckBuilder, RpDataMsToNetworkBuilder, RpDataNetworkToMsBuilder,
-    RpDataNetworkToMsStatusReportBuilder, RpErrorMsToNetworkBuilder, RpErrorNetworkToMsBuilder,
-    RpSmmaBuilder, SMSAddressBuilder, SmsDeliverBuilder, SmsDeliverReportBuilder,
-    SmsStatusReportBuilder, SmsSubmitBuilder, SmsSubmitReportBuilder, UserDataHeaderBuilder,
+    RpAckBuilder, RpAckMsToNetworkBuilder, RpAckNetworkToMsBuilder, RpDataMsToNetworkBuilder,
+    RpDataNetworkToMsBuilder, RpDataNetworkToMsStatusReportBuilder, RpErrorMsToNetworkBuilder,
+    RpErrorNetworkToMsBuilder, RpSmmaBuilder, SMSAddressBuilder, SmsDeliverBuilder,
+    SmsDeliverReportBuilder, SmsStatusReportBuilder, SmsSubmitBuilder, SmsSubmitReportBuilder,
+    UserDataHeaderBuilder,
 };
 
 #[cfg(feature = "python")]
@@ -1450,6 +1451,39 @@ pub const RP_SMMA_MS_TO_NETWORK: u8 = 0b110;
 /// RP-User-Data information element identifier (TS 24.011 §8.2.5.3).
 const RP_USER_DATA_ELEMENT_ID: u8 = 0x41;
 
+/// Read the non-imperative part of an RP-ACK or RP-ERROR (TS 24.007 §11.2.4)
+/// to the end of the message and return the value of its RP-User-Data, the
+/// only IE either message has there (TS 24.011 tables 7.7 and 7.8).
+///
+/// Any other IE is skipped, as the receiver "shall be prepared for the
+/// non-imperative part of the message to contain standard IEs that are not
+/// specified": one octet when bit 8 of its IEI is set (type 1 or 2), else by
+/// its length octet (type 4). An RP-User-Data that comes again is ignored, the
+/// first one counts (TS 24.008 §8.6.3; TS 24.011 has no rule of its own). An
+/// IE cut short by the end of the message is an error.
+fn decode_non_imperative_part(cursor: &mut Cursor<&[u8]>) -> Result<Option<Vec<u8>>, Error> {
+    let mut rp_user_data = None;
+    while remaining(cursor) > 0 {
+        let element_id = read_octet(cursor, "information element identifier")?;
+        if element_id & 0x80 != 0 {
+            continue;
+        }
+        let length = read_octet(
+            cursor,
+            &format!("length of information element 0x{element_id:02x}"),
+        )?;
+        let value = read_octets(
+            cursor,
+            usize::from(length),
+            &format!("information element 0x{element_id:02x}"),
+        )?;
+        if element_id == RP_USER_DATA_ELEMENT_ID && rp_user_data.is_none() {
+            rp_user_data = Some(value);
+        }
+    }
+    Ok(rp_user_data)
+}
+
 fn check_message_type(actual: u8, expected: u8, name: &str) -> Result<(), Error> {
     if actual == expected {
         Ok(())
@@ -1666,6 +1700,9 @@ pub fn parse_rp_data_network_to_ms(data: &[u8]) -> Result<RpDataNetworkToMsMessa
 /// `rp_user_data_element_id` is the RP-User-Data identifier, `0x41`, and
 /// `rp_user_data_element_length` the length of the encoded report. Both are
 /// checked by [`RpAck::encode`]; [`RpAck::builder`] fills them in.
+///
+/// For an RP-ACK without RP-User-Data, and to decode one, see
+/// [`RpAckNetworkToMs`] (`RpAckNetworkToMs::from(ack)` converts).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpAck {
     pub rp_message_type: u8,
@@ -1717,6 +1754,177 @@ impl RpAck {
     }
 }
 
+impl From<RpAck> for RpAckNetworkToMs {
+    fn from(ack: RpAck) -> Self {
+        RpAckNetworkToMs {
+            rp_message_type: ack.rp_message_type,
+            rp_message_reference: ack.rp_message_reference,
+            sms_submit_report: Some(ack.sms_submit_report),
+        }
+    }
+}
+
+/// Assemble an RP-ACK in either direction (TS 24.011 §7.3.3): the header and,
+/// when there is a TPDU, RP-User-Data around it.
+fn encode_relay_ack(
+    rp_message_type: u8,
+    rp_message_reference: u8,
+    tpdu: Option<Vec<u8>>,
+) -> Result<Vec<u8>, Error> {
+    let mut data = vec![rp_message_type, rp_message_reference];
+    if let Some(tpdu) = tpdu {
+        data.push(RP_USER_DATA_ELEMENT_ID);
+        encode_length_value("TPDU", &tpdu, &mut data)?;
+    }
+    Ok(data)
+}
+
+/// Read an RP-ACK in either direction, the TPDU still encoded. See
+/// [`decode_non_imperative_part`] for what may follow the header.
+fn decode_relay_ack(
+    data: &[u8],
+    expected: u8,
+    name: &str,
+) -> Result<(u8, u8, Option<Vec<u8>>), Error> {
+    let mut cursor = Cursor::new(data);
+    let (rp_message_type, rp_message_reference) = decode_relay_header(&mut cursor, expected, name)?;
+    let tpdu = decode_non_imperative_part(&mut cursor)?;
+    Ok((rp_message_type, rp_message_reference, tpdu))
+}
+
+/// RP-ACK, mobile station to network (TS 24.011 §7.3.3): the mobile station
+/// acknowledging an RP-DATA from the network.
+///
+/// The optional RP-User-Data carries the SMS-DELIVER-REPORT for RP-ACK of
+/// TS 23.040 §9.2.2.1a, so the report must not have a `tp_failure_cause`.
+///
+/// ```
+/// use tpdu::{RpAckMsToNetwork, SmsDeliverReport};
+///
+/// // Acknowledge the RP-DATA with RP-Message-Reference 7.
+/// let ack = RpAckMsToNetwork::builder()
+///     .message_reference(7)
+///     .sms_deliver_report(SmsDeliverReport::builder().build())
+///     .build();
+/// let wire = ack.encode()?;
+/// assert_eq!(wire, [0x02, 0x07, 0x41, 0x02, 0x00, 0x00]);
+///
+/// let decoded = RpAckMsToNetwork::decode(&wire)?;
+/// assert_eq!(decoded.rp_message_reference, 7);
+/// assert!(decoded.sms_deliver_report.is_some());
+/// # Ok::<(), tpdu::Error>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpAckMsToNetwork {
+    pub rp_message_type: u8,
+    pub rp_message_reference: u8,
+    pub sms_deliver_report: Option<SmsDeliverReport>,
+}
+
+impl RpAckMsToNetwork {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        check_message_type(
+            self.rp_message_type,
+            RP_ACK_MS_TO_NETWORK,
+            "RP-ACK (MS to network)",
+        )?;
+        let tpdu = match &self.sms_deliver_report {
+            Some(report) if report.tp_failure_cause.is_some() => {
+                return Err(
+                    "an SMS-DELIVER-REPORT with a TP-Failure-Cause belongs in an RP-ERROR, not \
+                     an RP-ACK"
+                        .into(),
+                );
+            }
+            Some(report) => Some(report.encode()?),
+            None => None,
+        };
+        encode_relay_ack(self.rp_message_type, self.rp_message_reference, tpdu)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let (rp_message_type, rp_message_reference, tpdu) =
+            decode_relay_ack(data, RP_ACK_MS_TO_NETWORK, "RP-ACK (MS to network)")?;
+        let sms_deliver_report = tpdu
+            .map(|tpdu| {
+                SmsDeliverReport::decode_for_rp_ack(&tpdu)
+                    .map_err(|e| format!("Could not decode TPDU: {e}"))
+            })
+            .transpose()?;
+        Ok(RpAckMsToNetwork {
+            rp_message_type,
+            rp_message_reference,
+            sms_deliver_report,
+        })
+    }
+}
+
+/// RP-ACK, network to mobile station (TS 24.011 §7.3.3): the network
+/// acknowledging an RP-DATA or RP-SMMA from the mobile station.
+///
+/// The optional RP-User-Data carries the SMS-SUBMIT-REPORT for RP-ACK of
+/// TS 23.040 §9.2.2.2a, so the report must not have a `tp_failure_cause`.
+/// Unlike [`RpAck`], which always carries a report, this one can be sent and
+/// decoded without.
+///
+/// ```
+/// use tpdu::RpAckNetworkToMs;
+///
+/// let wire = RpAckNetworkToMs::builder().message_reference(7).build().encode()?;
+/// assert_eq!(wire, [0x03, 0x07]);
+///
+/// let decoded = RpAckNetworkToMs::decode(&[0x03, 0x07, 0x41, 0x09, 0x01, 0x00,
+///     0x52, 0x10, 0x10, 0x21, 0x00, 0x00, 0x00])?;
+/// assert_eq!(decoded.rp_message_reference, 7);
+/// let report = decoded.sms_submit_report.expect("SMS-SUBMIT-REPORT");
+/// assert_eq!(report.tp_service_centre_timestamp, "25010112000000");
+/// # Ok::<(), tpdu::Error>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpAckNetworkToMs {
+    pub rp_message_type: u8,
+    pub rp_message_reference: u8,
+    pub sms_submit_report: Option<SmsSubmitReport>,
+}
+
+impl RpAckNetworkToMs {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        check_message_type(
+            self.rp_message_type,
+            RP_ACK_NETWORK_TO_MS,
+            "RP-ACK (network to MS)",
+        )?;
+        let tpdu = match &self.sms_submit_report {
+            Some(report) if report.tp_failure_cause.is_some() => {
+                return Err(
+                    "an SMS-SUBMIT-REPORT with a TP-Failure-Cause belongs in an RP-ERROR, not an \
+                     RP-ACK"
+                        .into(),
+                );
+            }
+            Some(report) => Some(report.encode()?),
+            None => None,
+        };
+        encode_relay_ack(self.rp_message_type, self.rp_message_reference, tpdu)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        let (rp_message_type, rp_message_reference, tpdu) =
+            decode_relay_ack(data, RP_ACK_NETWORK_TO_MS, "RP-ACK (network to MS)")?;
+        let sms_submit_report = tpdu
+            .map(|tpdu| {
+                SmsSubmitReport::decode_for_rp_ack(&tpdu)
+                    .map_err(|e| format!("Could not decode TPDU: {e}"))
+            })
+            .transpose()?;
+        Ok(RpAckNetworkToMs {
+            rp_message_type,
+            rp_message_reference,
+            sms_submit_report,
+        })
+    }
+}
+
 /// RP-Cause and what may follow it in an RP-ERROR (TS 24.011 §7.3.4).
 struct RelayError {
     rp_message_type: u8,
@@ -1760,21 +1968,7 @@ fn decode_relay_error(data: &[u8], expected: u8, name: &str) -> Result<RelayErro
     let rp_cause = cause.first().ok_or("RP-Cause is empty")? & 0x7F;
     let rp_diagnostic = cause.get(1).copied();
 
-    let tpdu = if remaining(&cursor) > 0 {
-        let element_id = read_octet(&mut cursor, "information element identifier")?;
-        if element_id == RP_USER_DATA_ELEMENT_ID {
-            let length = read_octet(&mut cursor, "RP-User-Data length")?;
-            Some(read_octets(
-                &mut cursor,
-                usize::from(length),
-                "RP-User-Data",
-            )?)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let tpdu = decode_non_imperative_part(&mut cursor)?;
 
     Ok(RelayError {
         rp_message_type,

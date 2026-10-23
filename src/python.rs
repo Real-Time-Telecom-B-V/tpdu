@@ -77,6 +77,8 @@ fn add_contents(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RpDataNetworkToMsBuilder>()?;
     m.add_class::<SmsSubmitReportBuilder>()?;
     m.add_class::<RpAckNetworkToMsBuilder>()?;
+    m.add_class::<RpAckMsToNetwork>()?;
+    m.add_class::<RpAckMsToNetworkBuilder>()?;
     m.add_class::<SmsDeliverReport>()?;
     m.add_class::<SmsStatusReport>()?;
     m.add_class::<RpDataNetworkToMsStatusReport>()?;
@@ -92,6 +94,7 @@ fn add_contents(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_rp_data_network_to_ms, m)?)?;
     m.add_function(wrap_pyfunction!(parse_sms_status_report, m)?)?;
     m.add_function(wrap_pyfunction!(parse_rp_error, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_rp_ack, m)?)?;
     m.add_function(wrap_pyfunction!(parse_rp_smma, m)?)?;
     m.add_function(wrap_pyfunction!(pack_gsm7_with_header, m)?)?;
     m.add_function(wrap_pyfunction!(unpack_gsm7_with_header, m)?)?;
@@ -761,39 +764,65 @@ impl SmsSubmitReport {
 ///
 /// Built by the IP-SM-GW immediately after accepting an MO RP-DATA from a UE;
 /// `rp_message_reference` must echo the inbound RP-MR so the UE can correlate.
+///
+/// `sms_submit_report` is optional: without it the RP-ACK is just the type
+/// and the reference.
 #[pyclass(module = "tpdu", name = "RpAckNetworkToMs", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct RpAckNetworkToMs {
-    inner: crate::RpAck,
+    inner: crate::RpAckNetworkToMs,
+}
+
+/// A bad SCTS or parameter set surfaces when the RP-ACK is made rather than at
+/// its encode().
+fn check_report_encodes(report: Option<&crate::SmsSubmitReport>) -> PyResult<()> {
+    if let Some(report) = report {
+        report.encode()?;
+    }
+    Ok(())
 }
 
 #[pymethods]
 impl RpAckNetworkToMs {
     #[new]
-    #[pyo3(signature = (sms_submit_report, *, rp_message_reference))]
-    fn new(sms_submit_report: SmsSubmitReport, rp_message_reference: u8) -> PyResult<Self> {
-        // Precompute the RP-User-Data IE length; a bad SCTS surfaces here
-        // rather than at encode().
-        let ie_len = sms_submit_report.inner.encode()?.len();
+    #[pyo3(signature = (sms_submit_report = None, *, rp_message_reference))]
+    fn new(sms_submit_report: Option<SmsSubmitReport>, rp_message_reference: u8) -> PyResult<Self> {
+        let sms_submit_report = sms_submit_report.map(|report| report.inner);
+        check_report_encodes(sms_submit_report.as_ref())?;
         Ok(Self {
-            inner: crate::RpAck {
-                rp_message_type: 0x03, // RP-ACK n→ms (TS 24.011 §8.2.2)
+            inner: crate::RpAckNetworkToMs {
+                rp_message_type: crate::RP_ACK_NETWORK_TO_MS,
                 rp_message_reference,
-                rp_user_data_element_id: 0x41, // RP-User-Data IEI (§8.2.5.3)
-                rp_user_data_element_length: ie_len as u8,
-                sms_submit_report: sms_submit_report.inner,
+                sms_submit_report,
             },
         })
     }
 
-    /// Start a fluent [`RpAckNetworkToMsBuilder`] around `sms_submit_report`
-    /// (RP-ACK Network→MS; RP-Message-Reference defaults to `0`).
+    /// Start a fluent [`RpAckNetworkToMsBuilder`], optionally around
+    /// `sms_submit_report` (RP-Message-Reference defaults to `0`).
     #[staticmethod]
-    fn builder(sms_submit_report: SmsSubmitReport) -> RpAckNetworkToMsBuilder {
+    #[pyo3(signature = (sms_submit_report = None))]
+    fn builder(sms_submit_report: Option<SmsSubmitReport>) -> RpAckNetworkToMsBuilder {
         RpAckNetworkToMsBuilder {
-            sms_submit_report: sms_submit_report.inner,
+            sms_submit_report: sms_submit_report.map(|report| report.inner),
             rp_message_reference: 0,
         }
+    }
+
+    #[getter]
+    fn rp_message_type(&self) -> u8 {
+        self.inner.rp_message_type
+    }
+    #[getter]
+    fn rp_message_reference(&self) -> u8 {
+        self.inner.rp_message_reference
+    }
+    #[getter]
+    fn sms_submit_report(&self) -> Option<SmsSubmitReport> {
+        self.inner
+            .sms_submit_report
+            .clone()
+            .map(|inner| SmsSubmitReport { inner })
     }
 
     /// Encode to wire bytes — drop into a SIP MESSAGE body with
@@ -801,6 +830,80 @@ impl RpAckNetworkToMs {
     fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = self.inner.encode()?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RpAckNetworkToMs(mr={}, sms_submit_report={})",
+            self.inner.rp_message_reference,
+            self.inner.sms_submit_report.is_some(),
+        )
+    }
+}
+
+// ── RpAckMsToNetwork (RP-ACK ms→n over a SIP MESSAGE) ───────────────────
+
+/// RP-ACK MS→Network (TS 24.011 §7.3.3): the UE acknowledging an MT
+/// RP-DATA. `rp_message_reference` echoes the RP-MR of that RP-DATA. The
+/// optional `sms_deliver_report` must not have a `tp_failure_cause`.
+#[pyclass(module = "tpdu", name = "RpAckMsToNetwork", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct RpAckMsToNetwork {
+    inner: crate::RpAckMsToNetwork,
+}
+
+#[pymethods]
+impl RpAckMsToNetwork {
+    #[new]
+    #[pyo3(signature = (sms_deliver_report = None, *, rp_message_reference))]
+    fn new(sms_deliver_report: Option<SmsDeliverReport>, rp_message_reference: u8) -> Self {
+        Self {
+            inner: crate::RpAckMsToNetwork {
+                rp_message_type: crate::RP_ACK_MS_TO_NETWORK,
+                rp_message_reference,
+                sms_deliver_report: sms_deliver_report.map(|report| report.inner),
+            },
+        }
+    }
+
+    /// Start a fluent [`RpAckMsToNetworkBuilder`] (RP-Message-Reference
+    /// defaults to `0`, no SMS-DELIVER-REPORT).
+    #[staticmethod]
+    fn builder() -> RpAckMsToNetworkBuilder {
+        RpAckMsToNetworkBuilder {
+            inner: crate::RpAckMsToNetwork::builder().build(),
+        }
+    }
+
+    #[getter]
+    fn rp_message_type(&self) -> u8 {
+        self.inner.rp_message_type
+    }
+    #[getter]
+    fn rp_message_reference(&self) -> u8 {
+        self.inner.rp_message_reference
+    }
+    #[getter]
+    fn sms_deliver_report(&self) -> Option<SmsDeliverReport> {
+        self.inner
+            .sms_deliver_report
+            .clone()
+            .map(|inner| SmsDeliverReport { inner })
+    }
+
+    /// Encode to wire bytes — drop into a SIP MESSAGE body with
+    /// `Content-Type: application/vnd.3gpp.sms`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.encode()?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RpAckMsToNetwork(mr={}, sms_deliver_report={})",
+            self.inner.rp_message_reference,
+            self.inner.sms_deliver_report.is_some(),
+        )
     }
 }
 
@@ -1671,7 +1774,7 @@ impl SmsSubmitReportBuilder {
 /// Builder for [`RpAckNetworkToMs`]. See [`RpAckNetworkToMs::builder`].
 #[pyclass(module = "tpdu", name = "RpAckNetworkToMsBuilder", skip_from_py_object)]
 pub struct RpAckNetworkToMsBuilder {
-    sms_submit_report: crate::SmsSubmitReport,
+    sms_submit_report: Option<crate::SmsSubmitReport>,
     rp_message_reference: u8,
 }
 
@@ -1682,22 +1785,41 @@ impl RpAckNetworkToMsBuilder {
         slf
     }
     fn sms_submit_report(mut slf: PyRefMut<'_, Self>, v: SmsSubmitReport) -> PyRefMut<'_, Self> {
-        slf.sms_submit_report = v.inner;
+        slf.sms_submit_report = Some(v.inner);
         slf
     }
     fn build(&self) -> PyResult<RpAckNetworkToMs> {
-        // A bad SCTS surfaces here (via the SMS-SUBMIT-REPORT encode) rather
-        // than at the RP-ACK's own encode().
-        let ie_len = self.sms_submit_report.encode()?.len();
+        check_report_encodes(self.sms_submit_report.as_ref())?;
         Ok(RpAckNetworkToMs {
-            inner: crate::RpAck {
-                rp_message_type: 0x03, // RP-ACK n→ms (TS 24.011 §8.2.2)
+            inner: crate::RpAckNetworkToMs {
+                rp_message_type: crate::RP_ACK_NETWORK_TO_MS,
                 rp_message_reference: self.rp_message_reference,
-                rp_user_data_element_id: 0x41, // RP-User-Data IEI (§8.2.5.3)
-                rp_user_data_element_length: ie_len as u8,
                 sms_submit_report: self.sms_submit_report.clone(),
             },
         })
+    }
+}
+
+/// Builder for [`RpAckMsToNetwork`]. See [`RpAckMsToNetwork::builder`].
+#[pyclass(module = "tpdu", name = "RpAckMsToNetworkBuilder", skip_from_py_object)]
+pub struct RpAckMsToNetworkBuilder {
+    inner: crate::RpAckMsToNetwork,
+}
+
+#[pymethods]
+impl RpAckMsToNetworkBuilder {
+    fn message_reference(mut slf: PyRefMut<'_, Self>, v: u8) -> PyRefMut<'_, Self> {
+        slf.inner.rp_message_reference = v;
+        slf
+    }
+    fn sms_deliver_report(mut slf: PyRefMut<'_, Self>, v: SmsDeliverReport) -> PyRefMut<'_, Self> {
+        slf.inner.sms_deliver_report = Some(v.inner);
+        slf
+    }
+    fn build(&self) -> RpAckMsToNetwork {
+        RpAckMsToNetwork {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -2010,6 +2132,28 @@ fn parse_rp_error<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAn
         .into_bound_py_any(py),
         Some(other) => Err(PyValueError::new_err(format!(
             "RP-Message-Type {other} is not RP-ERROR (4 or 5)"
+        ))),
+        None => Err(PyValueError::new_err("empty RP message")),
+    }
+}
+
+/// Parse an RP-ACK (TS 24.011 §7.3.3) in either direction. Returns an
+/// `RpAckMsToNetwork` for RP-Message-Type 2 (from the UE, may carry an
+/// SMS-DELIVER-REPORT) and an `RpAckNetworkToMs` for type 3 (from the
+/// network, may carry an SMS-SUBMIT-REPORT).
+#[pyfunction]
+fn parse_rp_ack<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    match data.first().map(|octet| octet & 0x07) {
+        Some(crate::RP_ACK_MS_TO_NETWORK) => RpAckMsToNetwork {
+            inner: crate::RpAckMsToNetwork::decode(data)?,
+        }
+        .into_bound_py_any(py),
+        Some(crate::RP_ACK_NETWORK_TO_MS) => RpAckNetworkToMs {
+            inner: crate::RpAckNetworkToMs::decode(data)?,
+        }
+        .into_bound_py_any(py),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "RP-Message-Type {other} is not RP-ACK (2 or 3)"
         ))),
         None => Err(PyValueError::new_err("empty RP message")),
     }

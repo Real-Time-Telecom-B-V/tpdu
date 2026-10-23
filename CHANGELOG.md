@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **RP-ACK** in both directions, encode and decode (TS 24.011 §7.3.3):
+  `RpAckMsToNetwork` with an optional SMS-DELIVER-REPORT and
+  `RpAckNetworkToMs` with an optional SMS-SUBMIT-REPORT, each with a
+  `builder()`. The decoders refuse an RP-Message-Type of the other direction,
+  an IE cut short by the end of the message and a TPDU of the wrong type, and
+  read what follows the header as RP-ERROR now does (see *Fixed*). `RpAck`
+  stays as it was and converts with `RpAckNetworkToMs::from`.
+- Python: `RpAckMsToNetwork` and its builder, `parse_rp_ack`, and getters on
+  `RpAckNetworkToMs`, whose `sms_submit_report` is now optional.
+
+### Fixed
+
+- **RP-ERROR behind an unknown IE** (TS 24.007 §11.2.4). The decoders stopped
+  at the first IE after RP-Cause that was not RP-User-Data, so an RP-User-Data
+  behind it was dropped and the message read as having none. Unknown IEs are
+  now skipped, one octet when bit 8 of the IEI is set and by their length
+  octet otherwise, and the first RP-User-Data counts when it comes twice
+  (TS 24.008 §8.6.3, TS 24.011 has no rule of its own). An IE cut short by
+  the end of the message, which used to be ignored, is now an error.
+
 ## [2.0.0] - 2026-10-09
 
 Wire-correctness release. Several fields were read from, or written to, the
