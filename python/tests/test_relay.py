@@ -152,6 +152,20 @@ def test_rp_ack_network_to_ms():
     assert tpdu.parse_rp_ack(h("03 07")).sms_submit_report is None
 
 
+def test_unknown_elements_are_skipped():
+    # TS 24.007 §11.2.4: an unknown IEI with bit 8 clear is TLV, with bit 8
+    # set a single octet. Neither hides the RP-User-Data behind it.
+    ack = tpdu.parse_rp_ack(h("02 07 42 01 aa c5 41 02 00 00"))
+    assert ack.sms_deliver_report.tp_failure_cause is None
+    error = tpdu.parse_rp_error(h(f"05 07 01 15 42 01 aa 41 0a 01 c3 00 {SCTS}"))
+    assert error.sms_submit_report.tp_failure_cause == 0xC3
+    # The first of a repeated RP-User-Data counts (TS 24.008 §8.6.3).
+    error = tpdu.parse_rp_error(h("04 07 01 16 41 03 00 d3 00 41 01 ff"))
+    assert error.sms_deliver_report.tp_failure_cause == 0xD3
+    with pytest.raises(ValueError):
+        tpdu.parse_rp_error(h("05 07 01 15 42"))
+
+
 def test_parse_rp_ack_refuses_what_is_not_one():
     for message in [
         "",
@@ -160,8 +174,8 @@ def test_parse_rp_ack_refuses_what_is_not_one():
         "02 07 41",
         "02 07 41 03 00 00",
         "02 07 41 00",
-        "02 07 42 02 00 00",
-        "02 07 41 02 00 00 ff",
+        "02 07 42",
+        "02 07 41 02 00 00 42 01",
         f"02 07 41 09 01 00 {SCTS}",
         "03 07 41 02 00 00",
     ]:

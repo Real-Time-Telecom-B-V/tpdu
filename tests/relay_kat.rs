@@ -236,6 +236,63 @@ fn wireshark_reads_rp_error_from_the_mobile_station() {
     );
 }
 
+// ── RP-ERROR, the non-imperative part (TS 24.007 §11.2.4) ────────────────────
+//
+// After RP-Cause, RP-User-Data is the only IE TS 24.011 table 7.8 lists. An
+// unknown IE is skipped: one octet when bit 8 of its IEI is set (type 1 or 2),
+// otherwise by its length octet (TLV, type 4).
+
+#[test]
+fn rp_error_skips_an_unknown_element_in_front_of_the_user_data() {
+    // RP_ERROR_TO_MS with IEI 0x42, length 1, value AA after RP-Cause.
+    let error = RpErrorNetworkToMs::decode(&octets(
+        "05 07 01 15 42 01 aa 41 0a 01 c3 00 52 10 10 21 00 00 00",
+    ))
+    .expect("decode");
+    assert_eq!(error.rp_cause, 21);
+    assert_eq!(error.sms_submit_report, Some(submit_report_for_rp_error()));
+
+    // RP_ERROR_FROM_MS with the one-octet IE 0xC5 after RP-Cause.
+    let error =
+        RpErrorMsToNetwork::decode(&octets("04 07 02 16 00 c5 41 03 00 d3 00")).expect("decode");
+    assert_eq!(error.rp_diagnostic, Some(0));
+    assert_eq!(
+        error.sms_deliver_report,
+        Some(SmsDeliverReport::builder().failure_cause(0xd3).build())
+    );
+}
+
+#[test]
+fn rp_error_takes_the_first_of_a_repeated_user_data() {
+    // TS 24.008 §8.6.3, for want of a rule in TS 24.011: "only the contents of
+    // the information element appearing first shall be handled".
+    let error =
+        RpErrorMsToNetwork::decode(&octets("04 07 01 16 41 03 00 d3 00 41 01 ff")).expect("decode");
+    assert_eq!(
+        error.sms_deliver_report,
+        Some(SmsDeliverReport::builder().failure_cause(0xd3).build())
+    );
+}
+
+#[test]
+fn rp_error_refuses_an_element_that_runs_past_the_message() {
+    for message in [
+        "05 07 01 15 42",                                  // IEI with no length octet
+        "05 07 01 15 42 02 aa",                            // value one octet short
+        "05 07 01 15 41 0b 01 c3 00 52 10 10 21 00 00 00", // RP-User-Data too
+        "05 07 01 15 41 0a 01 c3 00 52 10 10 21 00 00 00 42",
+    ] {
+        assert!(
+            RpErrorNetworkToMs::decode(&octets(message)).is_err(),
+            "{message}"
+        );
+    }
+    assert!(RpErrorMsToNetwork::decode(&octets("04 07 01 16 00")).is_err());
+    // The other direction stays an error.
+    assert!(RpErrorMsToNetwork::decode(&octets("05 07 01 15")).is_err());
+    assert!(RpErrorNetworkToMs::decode(&octets("04 07 01 16")).is_err());
+}
+
 // ── SMS-DELIVER-REPORT ───────────────────────────────────────────────────────
 
 #[test]

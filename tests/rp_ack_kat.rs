@@ -3,8 +3,8 @@
 //!
 //! RP-ACK is RP-Message-Type (§8.2.2), RP-Message-Reference (§8.2.3) and an
 //! optional RP-User-Data, a TLV with IEI 0x41 (§8.2.5.3) holding the TPDU: an
-//! SMS-DELIVER-REPORT from the mobile station (table 7.5), an
-//! SMS-SUBMIT-REPORT from the network (table 7.6). Every vector is written out
+//! SMS-DELIVER-REPORT from the mobile station, an SMS-SUBMIT-REPORT from the
+//! network (table 7.7). Every vector is written out
 //! by hand from those clauses and TS 23.040 §9.2.2.1a / §9.2.2.2a, so the
 //! decoders meet bytes this crate did not produce and the encoders have to
 //! reproduce them. What the encoders emit is then read back by Wireshark (see
@@ -296,19 +296,73 @@ fn a_truncated_or_mislengthed_user_data_element_is_refused() {
     }
 }
 
+// ── The non-imperative part (TS 24.007 §11.2.4) ──────────────────────────────
+//
+// RP-User-Data is the only IE TS 24.011 table 7.7 lists for RP-ACK. The
+// receiver "shall be prepared for the non-imperative part of the message to
+// contain standard IEs that are not specified", and for SMS an unknown IEI
+// with bit 8 set is a one-octet IE (type 1 or 2) while one with bit 8 clear is
+// TLV (type 4), whose length octet says how far to skip.
+
 #[test]
-fn an_element_other_than_rp_user_data_is_refused() {
-    // RP-ACK defines no information element but RP-User-Data (table 7.5/7.6).
-    assert!(RpAckMsToNetwork::decode(&octets("02 07 42 02 00 00")).is_err());
-    assert!(RpAckNetworkToMs::decode(&octets("03 07 01 15")).is_err());
+fn an_unknown_tlv_element_is_skipped() {
+    // IEI 0x42, length 1, value AA, then the RP-User-Data of
+    // ACK_FROM_MS_WITH_REPORT.
+    let ack = RpAckMsToNetwork::decode(&octets("02 07 42 01 aa 41 02 00 00")).expect("decode");
+    assert_eq!(ack.rp_message_reference, 7);
+    assert_eq!(
+        ack.sms_deliver_report,
+        Some(SmsDeliverReport::builder().build())
+    );
+    // An empty unknown element, after the RP-User-Data this time.
+    let ack = RpAckNetworkToMs::decode(&octets("03 07 41 09 01 00 52 10 10 21 00 00 00 7f 00"))
+        .expect("decode");
+    assert_eq!(ack.sms_submit_report, Some(submission_report()));
+    // Only unknown elements: an RP-ACK without RP-User-Data.
+    let ack = RpAckMsToNetwork::decode(&octets("02 07 42 02 00 00")).expect("decode");
+    assert_eq!(ack.sms_deliver_report, None);
 }
 
 #[test]
-fn octets_after_the_user_data_are_refused() {
-    assert!(RpAckMsToNetwork::decode(&octets("02 07 41 02 00 00 41 02 00 00")).is_err());
-    assert!(
-        RpAckNetworkToMs::decode(&octets("03 07 41 09 01 00 52 10 10 21 00 00 00 ff")).is_err()
+fn an_unknown_element_with_bit_8_set_is_one_octet() {
+    // 0xC5 (type 1, IEI 0xC and value 5) and 0xA0 (type 2) carry no length.
+    let ack = RpAckMsToNetwork::decode(&octets("02 07 c5 41 02 00 00 a0")).expect("decode");
+    assert_eq!(
+        ack.sms_deliver_report,
+        Some(SmsDeliverReport::builder().build())
     );
+    let ack = RpAckNetworkToMs::decode(&octets("03 07 ff")).expect("decode");
+    assert_eq!(ack.sms_submit_report, None);
+}
+
+#[test]
+fn a_repeated_rp_user_data_counts_once() {
+    // TS 24.011 has no rule for a repeated IE; TS 24.008 §8.6.3 does: "only
+    // the contents of the information element appearing first shall be
+    // handled and all subsequent repetitions ... shall be ignored". The second
+    // one here is not even a valid SMS-DELIVER-REPORT.
+    let ack = RpAckMsToNetwork::decode(&octets("02 07 41 02 00 00 41 01 ff")).expect("decode");
+    assert_eq!(
+        ack.sms_deliver_report,
+        Some(SmsDeliverReport::builder().build())
+    );
+}
+
+#[test]
+fn an_element_that_runs_past_the_message_is_refused() {
+    for message in [
+        "02 07 42",                // unknown IEI with no length octet
+        "02 07 42 03 00 00",       // unknown element of 3, two octets follow
+        "02 07 41 02 00 00 42",    // the same after a good RP-User-Data
+        "02 07 41 02 00 00 42 01", // and with its value missing
+    ] {
+        assert!(
+            RpAckMsToNetwork::decode(&octets(message)).is_err(),
+            "{message}"
+        );
+    }
+    // IEI 0x01 with length 0x15 and nothing behind it.
+    assert!(RpAckNetworkToMs::decode(&octets("03 07 01 15")).is_err());
 }
 
 #[test]

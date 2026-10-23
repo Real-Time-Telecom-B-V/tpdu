@@ -1451,6 +1451,39 @@ pub const RP_SMMA_MS_TO_NETWORK: u8 = 0b110;
 /// RP-User-Data information element identifier (TS 24.011 §8.2.5.3).
 const RP_USER_DATA_ELEMENT_ID: u8 = 0x41;
 
+/// Read the non-imperative part of an RP-ACK or RP-ERROR (TS 24.007 §11.2.4)
+/// to the end of the message and return the value of its RP-User-Data, the
+/// only IE either message has there (TS 24.011 tables 7.7 and 7.8).
+///
+/// Any other IE is skipped, as the receiver "shall be prepared for the
+/// non-imperative part of the message to contain standard IEs that are not
+/// specified": one octet when bit 8 of its IEI is set (type 1 or 2), else by
+/// its length octet (type 4). An RP-User-Data that comes again is ignored, the
+/// first one counts (TS 24.008 §8.6.3; TS 24.011 has no rule of its own). An
+/// IE cut short by the end of the message is an error.
+fn decode_non_imperative_part(cursor: &mut Cursor<&[u8]>) -> Result<Option<Vec<u8>>, Error> {
+    let mut rp_user_data = None;
+    while remaining(cursor) > 0 {
+        let element_id = read_octet(cursor, "information element identifier")?;
+        if element_id & 0x80 != 0 {
+            continue;
+        }
+        let length = read_octet(
+            cursor,
+            &format!("length of information element 0x{element_id:02x}"),
+        )?;
+        let value = read_octets(
+            cursor,
+            usize::from(length),
+            &format!("information element 0x{element_id:02x}"),
+        )?;
+        if element_id == RP_USER_DATA_ELEMENT_ID && rp_user_data.is_none() {
+            rp_user_data = Some(value);
+        }
+    }
+    Ok(rp_user_data)
+}
+
 fn check_message_type(actual: u8, expected: u8, name: &str) -> Result<(), Error> {
     if actual == expected {
         Ok(())
@@ -1746,11 +1779,8 @@ fn encode_relay_ack(
     Ok(data)
 }
 
-/// Read an RP-ACK in either direction, the TPDU still encoded.
-///
-/// RP-User-Data is the only information element an RP-ACK has (TS 24.011
-/// tables 7.5 and 7.6), so any other identifier, an RP-User-Data that is
-/// empty or runs past the message, and octets after it are all refused.
+/// Read an RP-ACK in either direction, the TPDU still encoded. See
+/// [`decode_non_imperative_part`] for what may follow the header.
 fn decode_relay_ack(
     data: &[u8],
     expected: u8,
@@ -1758,28 +1788,8 @@ fn decode_relay_ack(
 ) -> Result<(u8, u8, Option<Vec<u8>>), Error> {
     let mut cursor = Cursor::new(data);
     let (rp_message_type, rp_message_reference) = decode_relay_header(&mut cursor, expected, name)?;
-    if remaining(&cursor) == 0 {
-        return Ok((rp_message_type, rp_message_reference, None));
-    }
-
-    let element_id = read_octet(&mut cursor, "information element identifier")?;
-    if element_id != RP_USER_DATA_ELEMENT_ID {
-        return Err(format!(
-            "{name} has no information element 0x{element_id:02x}, only RP-User-Data \
-             (0x{RP_USER_DATA_ELEMENT_ID:02x})"
-        )
-        .into());
-    }
-    let length = usize::from(read_octet(&mut cursor, "RP-User-Data length")?);
-    if length == 0 {
-        return Err("RP-User-Data is empty, it has no TPDU".into());
-    }
-    let tpdu = read_octets(&mut cursor, length, "RP-User-Data")?;
-    let left = remaining(&cursor);
-    if left > 0 {
-        return Err(format!("{left} octets follow the RP-User-Data of the {name}").into());
-    }
-    Ok((rp_message_type, rp_message_reference, Some(tpdu)))
+    let tpdu = decode_non_imperative_part(&mut cursor)?;
+    Ok((rp_message_type, rp_message_reference, tpdu))
 }
 
 /// RP-ACK, mobile station to network (TS 24.011 §7.3.3): the mobile station
@@ -1958,21 +1968,7 @@ fn decode_relay_error(data: &[u8], expected: u8, name: &str) -> Result<RelayErro
     let rp_cause = cause.first().ok_or("RP-Cause is empty")? & 0x7F;
     let rp_diagnostic = cause.get(1).copied();
 
-    let tpdu = if remaining(&cursor) > 0 {
-        let element_id = read_octet(&mut cursor, "information element identifier")?;
-        if element_id == RP_USER_DATA_ELEMENT_ID {
-            let length = read_octet(&mut cursor, "RP-User-Data length")?;
-            Some(read_octets(
-                &mut cursor,
-                usize::from(length),
-                "RP-User-Data",
-            )?)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let tpdu = decode_non_imperative_part(&mut cursor)?;
 
     Ok(RelayError {
         rp_message_type,
